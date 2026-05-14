@@ -10,7 +10,7 @@ from app.models.schemas import (
     ActionResponse,
     FeedCategory,
 )
-from app.services import store
+from app.services import database as db
 from app.services.rss_parser import parse_feed
 
 router = APIRouter(prefix="/v1/feeds", tags=["Feed Management"])
@@ -22,10 +22,7 @@ router = APIRouter(prefix="/v1/feeds", tags=["Feed Management"])
     summary="Preview a feed without saving",
 )
 async def preview_feed(body: PreviewFeedRequest, _=Depends(require_admin_access)):
-    """
-    Fetch and normalise an RSS/Atom feed without persisting it.
-    Useful for validating a feed URL before registering it.
-    """
+    """Fetch and normalise an RSS/Atom feed without persisting it."""
     try:
         return await parse_feed(body.url, limit=body.limit)
     except Exception as e:
@@ -39,12 +36,9 @@ async def preview_feed(body: PreviewFeedRequest, _=Depends(require_admin_access)
     summary="Add a new RSS feed",
 )
 async def add_feed(body: AddFeedRequest, _=Depends(require_admin_access)):
-    """
-    Register an RSS/Atom feed URL. The feed is automatically fetched
-    on the next /v1/today request when the cache is stale (TTL 5 min).
-    """
+    """Register an RSS/Atom feed. Next cron run will fetch stories from it."""
     feed_id = hashlib.md5(body.url.encode()).hexdigest()[:12]
-    if store.get_feed(feed_id):
+    if await db.get_feed(feed_id):
         raise HTTPException(status_code=409, detail="Feed already registered")
     try:
         f = feedparser.parse(body.url)
@@ -53,8 +47,14 @@ async def add_feed(body: AddFeedRequest, _=Depends(require_admin_access)):
         name = body.name or getattr(f.feed, "title", None) or body.url
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid feed: {e}")
-    feed = FeedSource(id=feed_id, name=name, url=body.url, category=body.category)
-    return store.add_feed(feed)
+    feed = FeedSource(
+        id=feed_id,
+        name=name,
+        url=body.url,
+        category=body.category,
+        is_user_selectable=body.is_user_selectable,
+    )
+    return await db.add_feed(feed)
 
 
 @router.delete(
@@ -63,11 +63,7 @@ async def add_feed(body: AddFeedRequest, _=Depends(require_admin_access)):
     summary="Remove a feed by ID",
 )
 async def delete_feed(feed_id: str, _=Depends(require_admin_access)):
-    """
-    Remove a registered feed by its ID.
-    Cached stories from this feed remain until TTL expires.
-    """
-    if not store.delete_feed(feed_id):
+    if not await db.delete_feed(feed_id):
         raise HTTPException(status_code=404, detail="Feed not found")
     return ActionResponse(success=True, message=f"Feed {feed_id} deleted")
 
@@ -81,8 +77,7 @@ async def list_feeds(
     category: FeedCategory = None,
     _=Depends(require_admin_access),
 ):
-    """List all active feeds, optionally filtered by category."""
-    return store.list_feeds(category)
+    return await db.list_feeds(category)
 
 
 @router.post(
@@ -91,13 +86,13 @@ async def list_feeds(
     summary="Force refresh a specific feed",
 )
 async def refresh_feed(feed_id: str, _=Depends(require_admin_access)):
-    """Force-fetch a feed and update the story cache immediately."""
-    feed = store.get_feed(feed_id)
+    """Force-fetch a single feed and update the story cache immediately."""
+    feed = await db.get_feed(feed_id)
     if not feed:
         raise HTTPException(status_code=404, detail="Feed not found")
     try:
         cards = await parse_feed(feed.url, category=feed.category)
-        store.cache_stories(cards)
+        await db.cache_stories(cards)
         return ActionResponse(
             success=True,
             message=f"Refreshed {len(cards)} stories from {feed.name}",

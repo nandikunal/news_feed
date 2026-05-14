@@ -6,7 +6,11 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     API_KEY: str = "dev-api-key"
     ADMIN_API_KEY: str = "dev-admin-key"
+    INTERNAL_REFRESH_KEY: str = "dev-internal-refresh-key"  # used by cron / scheduler
     CORS_ORIGINS: str = "http://localhost:3000"
+    DB_PATH: str = "news_feed.db"           # swap to ":memory:" for tests
+    CACHE_TTL_SECONDS: int = 600            # 10 min — ideal polling cadence for news RSS
+    DEDUP_TITLE_THRESHOLD: float = 0.72     # SequenceMatcher ratio for title dedup
 
     @property
     def cors_origins_list(self) -> List[str]:

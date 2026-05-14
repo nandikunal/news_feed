@@ -1,49 +1,70 @@
 import asyncio
 import hashlib
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.routers import feeds, today, stories, health
+from app.routers import feeds, today, stories, health, internal, sources
 
+logger = logging.getLogger(__name__)
+
+# ── Curated default source list (seeded on first startup) ────────────────────
+# CC-licensed feeds are safe for AI summarisation + commercial use.
+# Standard feeds (BBC, NYT etc.) are display-only (RSS reader model).
 DEFAULT_FEEDS = [
-    {"url": "https://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News", "category": "today"},
-    {"url": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml", "name": "NY Times", "category": "today"},
-    {"url": "https://feeds.skynews.com/feeds/rss/world.xml", "name": "Sky News World", "category": "today"},
+    # CC BY 3.0 — AI summary safe
+    {"url": "https://globalvoices.org/feed/", "name": "Global Voices", "category": "today", "selectable": True},
+    {"url": "https://globalvoices.org/world/westerneurope/germany/feed/", "name": "Global Voices — Germany", "category": "today", "selectable": True},
+    {"url": "https://advox.globalvoices.org/feed/", "name": "GV Advocacy", "category": "today", "selectable": True},
 ]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from app.services import store
-    from app.services.rss_parser import parse_feed
+    from app.services import database as db
     from app.models.schemas import FeedSource, FeedCategory
 
+    # 1. Initialise DB tables + indexes
+    await db.init_db()
+
+    # 2. Clean up old feeds and stories on every start
+    await db.clear_all()
+
+    # 3. Seed default feeds (idempotent)
     for f in DEFAULT_FEEDS:
         fid = hashlib.md5(f["url"].encode()).hexdigest()[:12]
-        if not store.get_feed(fid):
-            store.add_feed(
-                FeedSource(
-                    id=fid,
-                    name=f["name"],
-                    url=f["url"],
-                    category=FeedCategory(f["category"]),
-                )
-            )
+        if not await db.get_feed(fid):
+            await db.add_feed(FeedSource(
+                id=fid,
+                name=f["name"],
+                url=f["url"],
+                category=FeedCategory(f["category"]),
+                is_user_selectable=f.get("selectable", True),
+            ))
 
-    try:
-        feed_list = store.list_feeds(category=FeedCategory.today)
-        results = await asyncio.gather(
-            *[parse_feed(fd.url, category=fd.category) for fd in feed_list],
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, list):
-                store.cache_stories(r)
-    except Exception:
-        pass
+    # 4. Non-blocking initial cache warm
+    asyncio.create_task(_initial_warm())
+
+    # 5. APScheduler only in dev — production uses Render cron -> /v1/internal/refresh
+    _scheduler = None
+    if settings.APP_ENV != "production":
+        from app.services.scheduler import start_apscheduler
+        _scheduler = start_apscheduler()
 
     yield
+
+    if _scheduler:
+        _scheduler.shutdown(wait=False)
+
+
+async def _initial_warm():
+    """Fire-and-forget: warms the DB cache after startup without blocking."""
+    try:
+        from app.services.scheduler import refresh_all_feeds
+        await refresh_all_feeds()
+    except Exception as exc:
+        logger.warning(f"Initial cache warm failed: {exc}")
 
 
 app = FastAPI(
@@ -51,10 +72,11 @@ app = FastAPI(
     description=(
         "Swipe-card RSS backend for a TikTok-style news app.\n\n"
         "Pass `X-API-Key` header on every request.\n\n"
-        "- **Read key** (`API_KEY`): Today tab, search, story actions\n"
+        "- **Read key** (`API_KEY`): Today tab, search, story actions, source list\n"
         "- **Admin key** (`ADMIN_API_KEY`): Feed management\n"
+        "- **Internal key** (`INTERNAL_REFRESH_KEY`): Cron-triggered refresh\n"
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -70,3 +92,5 @@ app.include_router(health.router)
 app.include_router(today.router)
 app.include_router(stories.router)
 app.include_router(feeds.router)
+app.include_router(sources.router)
+app.include_router(internal.router)

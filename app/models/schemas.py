@@ -33,6 +33,7 @@ class StoryCard(BaseModel):
     link: str
     image_url: str
     source: str
+    source_names: List[str] = []        # populated when multiple feeds report same story
     published_at: Optional[datetime] = None
     topic: TopicLabel = TopicLabel.general
     read: bool = False
@@ -47,6 +48,7 @@ class FeedSource(BaseModel):
     url: str
     category: FeedCategory = FeedCategory.today
     active: bool = True
+    is_user_selectable: bool = True     # shown in onboarding picker
     added_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -54,6 +56,7 @@ class AddFeedRequest(BaseModel):
     url: str = Field(..., description="Full RSS/Atom feed URL")
     name: Optional[str] = Field(None, description="Display name (auto-detected if omitted)")
     category: FeedCategory = FeedCategory.today
+    is_user_selectable: bool = True
 
 
 class PreviewFeedRequest(BaseModel):
@@ -61,16 +64,34 @@ class PreviewFeedRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=50)
 
 
+class SelectSourcesRequest(BaseModel):
+    """Sent by Flutter app during onboarding — user picks 2–5 feeds."""
+    feed_ids: List[str] = Field(..., min_length=2, max_length=5)
+
+
 class ActionResponse(BaseModel):
     success: bool
     message: str
 
+
+# ── Response models with cache metadata ──────────────────────────────────────
 
 class TodayFeedResponse(BaseModel):
     stories: List[StoryCard]
     total: int
     page: int
     per_page: int
+    cached_at: Optional[datetime] = None
+    last_refresh_at: Optional[datetime] = None
+    from_cache: bool = True
+
+
+class UpdatesResponse(BaseModel):
+    """Returns only stories added to cache after `since` timestamp."""
+    stories: List[StoryCard]
+    total_new: int
+    since: datetime
+    checked_at: datetime
 
 
 class SearchResponse(BaseModel):

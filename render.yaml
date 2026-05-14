@@ -10,7 +10,33 @@ services:
         generateValue: true
       - key: ADMIN_API_KEY
         generateValue: true
+      - key: INTERNAL_REFRESH_KEY
+        generateValue: true
       - key: APP_ENV
         value: production
       - key: CORS_ORIGINS
         value: https://yourapp.com
+      - key: CACHE_TTL_SECONDS
+        value: "600"
+      - key: DB_PATH
+        value: "news_feed.db"
+      - key: DEDUP_TITLE_THRESHOLD
+        value: "0.72"
+
+  # Cron job: hits /v1/internal/refresh on a schedule
+  # Free Render plan: minimum 1x/hour  -> use "0 * * * *"
+  # Paid Render plan: every 15 min    -> use "*/15 * * * *"
+  - type: cron
+    name: rss-refresh-cron
+    env: docker
+    dockerfilePath: ./Dockerfile
+    schedule: "0 * * * *"
+    command: >
+      curl -s -X POST https://rss-news-api.onrender.com/v1/internal/refresh
+      -H "X-API-Key: $INTERNAL_REFRESH_KEY"
+    envVars:
+      - key: INTERNAL_REFRESH_KEY
+        fromService:
+          name: rss-news-api
+          type: web
+          envVarKey: INTERNAL_REFRESH_KEY
