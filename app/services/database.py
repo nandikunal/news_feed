@@ -272,11 +272,67 @@ async def get_stories(
             return [_row_to_story(r) for r in rows]
 
 
+async def get_stories_for_today(
+    category: Optional[FeedCategory] = None,
+    since: Optional[datetime] = None,
+    page: int = 1,
+    per_page: int = 5,
+    topics: Optional[List[TopicLabel]] = None,
+) -> List[StoryCard]:
+    """Timezone-aware story fetch: only returns stories published after `since` cutoff."""
+    query = "SELECT * FROM stories WHERE 1=1"
+    params: list = []
+    if category:
+        query += " AND category = ?"
+        params.append(category.value)
+    if since:
+        query += " AND cached_at >= ?"
+        params.append(since.isoformat())
+    if topics:
+        placeholders = ",".join("?" * len(topics))
+        query += f" AND topic IN ({placeholders})"
+        params.extend(t.value for t in topics)
+    query += " ORDER BY published_at DESC LIMIT ? OFFSET ?"
+    params += [per_page, (page - 1) * per_page]
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute(query, params) as cur:
+            rows = await cur.fetchall()
+            return [_row_to_story(r) for r in rows]
+
+
+async def count_stories_for_today(
+    category: Optional[FeedCategory] = None,
+    since: Optional[datetime] = None,
+    topics: Optional[List[TopicLabel]] = None,
+    read_filter: Optional[bool] = None,
+) -> int:
+    """Count deduplicated stories for today, with optional read and topic filters."""
+    query = "SELECT COUNT(*) FROM stories WHERE 1=1"
+    params: list = []
+    if category:
+        query += " AND category = ?"
+        params.append(category.value)
+    if since:
+        query += " AND cached_at >= ?"
+        params.append(since.isoformat())
+    if topics:
+        placeholders = ",".join("?" * len(topics))
+        query += f" AND topic IN ({placeholders})"
+        params.extend(t.value for t in topics)
+    if read_filter is not None:
+        query += " AND read = ?"
+        params.append(int(read_filter))
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute(query, params) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
 async def get_stories_since(
     since: datetime,
     category: Optional[FeedCategory] = None,
 ) -> List[StoryCard]:
-    """For the /v1/today/updates endpoint — incremental polling."""
+    """For the /v1/today/updates SSE endpoint — incremental polling."""
     query = "SELECT * FROM stories WHERE cached_at > ?"
     params: list = [since.isoformat()]
     if category:

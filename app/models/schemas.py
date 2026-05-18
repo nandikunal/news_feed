@@ -98,3 +98,12 @@ class SearchResponse(BaseModel):
     stories: List[StoryCard]
     query: str
     total: int
+
+
+class StatsResponse(BaseModel):
+    """Deduplicated read/unread/total counts for today's stories."""
+    read: int
+    unread: int
+    total: int
+    deduplicated_total: int
+    as_of: datetime
