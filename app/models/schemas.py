@@ -1,7 +1,7 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List
 from datetime import datetime
+from typing import List, Optional
 from enum import Enum
+from pydantic import BaseModel, HttpUrl, field_validator
 
 
 class FeedCategory(str, Enum):
@@ -14,67 +14,85 @@ class FeedCategory(str, Enum):
 
 class TopicLabel(str, Enum):
     politics = "politics"
-    health = "health"
     tech = "tech"
     finance = "finance"
     sports = "sports"
+    health = "health"
+    culture = "culture"
+    environment = "environment"
     transport = "transport"
-    weather = "weather"
-    local = "local"
-    entertainment = "entertainment"
-    science = "science"
+    berlin = "berlin"
+    germany = "germany"
     general = "general"
+    economy = "economy"
+    news = "news"
 
 
 class StoryCard(BaseModel):
     id: str
     title: str
     short_content: str
+    image_url: Optional[str] = None
     link: str
-    image_url: str
     source: str
-    source_names: List[str] = []        # populated when multiple feeds report same story
+    category: FeedCategory
+    topic: TopicLabel
     published_at: Optional[datetime] = None
-    topic: TopicLabel = TopicLabel.general
+    cached_at: Optional[datetime] = None
     read: bool = False
     liked: bool = False
     bookmarked: bool = False
-    category: FeedCategory = FeedCategory.today
 
 
-class FeedSource(BaseModel):
-    id: str
-    name: str
+class FeedPreview(BaseModel):
     url: str
+    title: Optional[str] = None
+    story_count: int = 0
+    sample_stories: List[StoryCard] = []
+
+
+class FeedCreate(BaseModel):
+    url: str
+    name: Optional[str] = None
     category: FeedCategory = FeedCategory.today
-    active: bool = True
-    is_user_selectable: bool = True     # shown in onboarding picker
-    added_at: datetime = Field(default_factory=datetime.utcnow)
+    topic: TopicLabel = TopicLabel.general
+
+    @field_validator('url')
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        if not v.startswith(('http://', 'https://')):
+            raise ValueError('URL must start with http:// or https://')
+        return v
 
 
-class AddFeedRequest(BaseModel):
-    url: str = Field(..., description="Full RSS/Atom feed URL")
-    name: Optional[str] = Field(None, description="Display name (auto-detected if omitted)")
-    category: FeedCategory = FeedCategory.today
-    is_user_selectable: bool = True
-
-
-class PreviewFeedRequest(BaseModel):
-    url: str = Field(..., description="RSS/Atom feed URL to preview")
-    limit: int = Field(default=10, ge=1, le=50)
-
-
-class SelectSourcesRequest(BaseModel):
-    """Sent by Flutter app during onboarding — user picks 2–5 feeds."""
-    feed_ids: List[str] = Field(..., min_length=2, max_length=5)
+class FeedRecord(BaseModel):
+    id: str
+    url: str
+    name: Optional[str] = None
+    category: FeedCategory
+    topic: TopicLabel
+    created_at: datetime
+    last_fetched_at: Optional[datetime] = None
+    story_count: int = 0
+    is_active: bool = True
 
 
 class ActionResponse(BaseModel):
     success: bool
-    message: str
+    message: str = ""
 
 
-# ── Response models with cache metadata ──────────────────────────────────────
+class SearchResponse(BaseModel):
+    stories: List[StoryCard]
+    query: str
+    total: int
+
+
+class UpdatesResponse(BaseModel):
+    new_stories: List[StoryCard]
+    count: int
+    checked_at: datetime
+
 
 class TodayFeedResponse(BaseModel):
     stories: List[StoryCard]
@@ -84,17 +102,30 @@ class TodayFeedResponse(BaseModel):
     cached_at: Optional[datetime] = None
     last_refresh_at: Optional[datetime] = None
     from_cache: bool = True
+    new_stories_available: bool = False
 
 
-class UpdatesResponse(BaseModel):
-    """Returns only stories added to cache after `since` timestamp."""
-    stories: List[StoryCard]
-    total_new: int
-    since: datetime
-    checked_at: datetime
-
-
-class SearchResponse(BaseModel):
-    stories: List[StoryCard]
-    query: str
+class StatsResponse(BaseModel):
+    """Deduplicated read/unread/total counts for today's feed (device-scoped)."""
+    read: int
+    unread: int
     total: int
+    deduplicated_total: int
+
+
+class UserSession(BaseModel):
+    """Per-device session state."""
+    device_id: str
+    read_story_ids: List[str] = []
+    last_story_index: int = 0
+    selected_topics: List[str] = []
+    display_name: str = ""
+    location_label: str = ""
+    last_seen_at: Optional[str] = None
+
+
+class SessionUpdateRequest(BaseModel):
+    last_story_index: int = 0
+    selected_topics: List[str] = []
+    display_name: str = ""
+    location_label: str = ""
