@@ -1,152 +1,190 @@
 import asyncio
 import json
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Query, Request, HTTPException
 from fastapi.responses import StreamingResponse
-
 from app.core.security import require_read_access
 from app.models.schemas import (
-    TodayFeedResponse,
-    SearchResponse,
-    FeedCategory,
-    StatsResponse,
-    UserSession,
-    SessionUpdateRequest,
+    TodayFeedResponse, SearchResponse, FeedStatsResponse, FeedCategory,
 )
 from app.services import database as db
 
 router = APIRouter(prefix="/v1/today", tags=["Today Tab"])
 
 
-def _get_device_id(x_device_id: str = Header(default="anonymous")) -> str:
-    """Extract device ID from X-Device-ID request header."""
-    return x_device_id or "anonymous"
+def _local_midnight_utc(tz_name: str) -> datetime:
+    """Return today's midnight in the given IANA timezone as a UTC-aware datetime."""
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError):
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz_name!r}")
+    local_now = datetime.now(tz)
+    midnight_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight_local.astimezone(timezone.utc)
+
+
+def _session_id(request: Request) -> str:
+    return request.headers.get("X-Session-ID", "default")
+
+
+def _since_cutoff(tz: str) -> datetime:
+    """Compute the stricter of local midnight and 24 h ago."""
+    midnight = _local_midnight_utc(tz)
+    cap = datetime.now(timezone.utc) - timedelta(hours=24)
+    return max(midnight, cap)
 
 
 @router.get(
     "",
     response_model=TodayFeedResponse,
-    summary="Get today's unread stories for this device",
+    summary="Get today's stories — timezone-aware, topic-filtered, session-aware",
 )
 async def get_today_stories(
-    page: int = Query(default=1, ge=1, description="Page number"),
-    per_page: int = Query(default=5, ge=1, le=20, description="Stories per page"),
-    tz: str = Query(
-        default="UTC",
-        description="IANA timezone string from device, e.g. Europe/Berlin",
-    ),
-    topics: str = Query(
-        default="",
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    per_page: int = Query(default=5, ge=1, le=20),
+    tz: str = Query(default="UTC", description="IANA timezone, e.g. Europe/Berlin"),
+    topics: Optional[str] = Query(
+        default=None,
         description="Comma-separated topic filter, e.g. tech,sports,health",
     ),
-    device_id: str = Depends(_get_device_id),
+    hide_read: bool = Query(
+        default=True,
+        description="Exclude stories already read in this session",
+    ),
     _=Depends(require_read_access),
 ):
     """
-    Returns unread stories for today (device-scoped).
-
-    - Filters stories already read by this device (X-Device-ID header)
-    - Respects user's local timezone for 'today' boundary (tz param)
-    - Hard cap: never returns stories older than 24h UTC
-    - Optional client-side topic filter via ?topics=tech,sports
+    Flutter usage:
+      GET /v1/today?page=1&per_page=20&tz=Europe/Berlin&hide_read=true
+      GET /v1/today?topics=tech,sports&tz=Europe/Berlin
     """
-    topic_list = (
-        [t.strip() for t in topics.split(",") if t.strip()] if topics else None
-    )
+    session_id = _session_id(request)
+    since = _since_cutoff(tz)
+
+    topic_list: Optional[List[str]] = None
+    if topics:
+        topic_list = [t.strip().lower() for t in topics.split(",") if t.strip()]
+
+    exclude_ids: Optional[List[str]] = None
+    if hide_read:
+        exclude_ids = await db.get_session_read_ids(session_id)
 
     meta = await db.get_cache_meta()
-    stories = await db.get_stories_excluding_read(
-        device_id=device_id,
+    stories = await db.get_stories(
         category=FeedCategory.today,
         page=page,
         per_page=per_page,
-        tz=tz,
+        since_published=since,
         topics=topic_list,
+        exclude_ids=exclude_ids,
     )
-    total = await db.count_stories_excluding_read(
-        device_id=device_id,
+    total = await db.count_stories(
         category=FeedCategory.today,
-        tz=tz,
+        since_published=since,
     )
     return TodayFeedResponse(
         stories=stories,
         total=total,
         page=page,
         per_page=per_page,
-        last_refresh_at=meta.get("last_refresh_at") if meta else None,
-        cached_at=datetime.utcnow(),
+        last_refresh_at=meta.get("last_refresh_at"),
+        cached_at=datetime.now(timezone.utc),
         from_cache=True,
-        new_stories_available=False,
     )
 
 
 @router.get(
     "/stats",
-    response_model=StatsResponse,
-    summary="Get read/unread/total counts for today (device-scoped)",
+    response_model=FeedStatsResponse,
+    summary="Get deduplicated read/unread/total counts for today",
 )
-async def get_today_stats(
-    device_id: str = Depends(_get_device_id),
+async def get_feed_stats(
+    request: Request,
+    tz: str = Query(default="UTC"),
     _=Depends(require_read_access),
 ):
     """
-    Returns deduplicated read/unread/total for today's feed.
-    Counts are scoped to this device's read history via X-Device-ID.
-    Call on app launch and after every /read action to keep the UI in sync.
+    Called in parallel with stories fetch on app launch.
+    Re-called after every POST /v1/stories/{id}/read.
+    Sends X-Session-ID header to track per-device read state.
     """
-    stats = await db.get_today_stats(device_id=device_id)
-    return StatsResponse(**stats)
+    session_id = _session_id(request)
+    since = _since_cutoff(tz)
+    stats = await db.get_session_stats(session_id, since_published=since)
+    return FeedStatsResponse(
+        read=stats["read"],
+        unread=stats["unread"],
+        total=stats["total"],
+        deduplicated_total=stats["total"],
+    )
 
 
 @router.get(
     "/updates",
-    summary="SSE stream — pushes new story counts as they arrive",
+    summary="SSE stream — push new story events as they arrive in the cache",
 )
 async def get_updates_sse(
-    device_id: str = Depends(_get_device_id),
+    request: Request,
+    since: datetime = Query(
+        ...,
+        description="ISO 8601 timestamp — Flutter sends its last known cached_at value",
+    ),
     _=Depends(require_read_access),
 ):
     """
-    Server-Sent Events endpoint. Flutter subscribes on app foreground,
-    disconnects when app goes to background (AppLifecycleState.paused).
+    Server-Sent Events endpoint.
 
-    Polls every 30s. Emits a JSON event when new unread stories appear:
-      data: {"new_count": 3, "total_unread": 27, "checked_at": "2026-05-18T..."}
+    Flutter app:
+      - Connects on foreground resume
+      - Disconnects on background pause
+      - Sends: GET /v1/today/updates?since=<last_cached_at_iso>
 
-    Sends a heartbeat comment every 30s when no change, to keep the
-    connection alive through proxies and load balancers.
+    Each event:  data: {"total_new": N, "stories": [{id, title, ...}]}
+    Keepalive:   : ping  (every 25 s to survive proxy timeouts)
     """
+    last_since = since
 
     async def event_stream():
-        last_total = await db.count_stories_excluding_read(
-            device_id, FeedCategory.today
-        )
-        while True:
-            await asyncio.sleep(30)
-            try:
-                current_total = await db.count_stories_excluding_read(
-                    device_id, FeedCategory.today
+        nonlocal last_since
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                new_stories = await db.get_stories_since(
+                    last_since, category=FeedCategory.today
                 )
-                if current_total != last_total:
-                    new_count = max(0, current_total - last_total)
-                    payload = json.dumps(
-                        {
-                            "new_count": new_count,
-                            "total_unread": current_total,
-                            "checked_at": datetime.utcnow().isoformat(),
-                        }
-                    )
+                if new_stories:
+                    payload = json.dumps({
+                        "total_new": len(new_stories),
+                        "stories": [
+                            {
+                                "id": s.id,
+                                "title": s.title,
+                                "short_content": s.short_content,
+                                "image_url": s.image_url,
+                                "source": s.source,
+                                "topic": s.topic.value,
+                                "category": s.category.value,
+                                "published_at": s.published_at.isoformat()
+                                if s.published_at else None,
+                            }
+                            for s in new_stories
+                        ],
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                    })
                     yield f"data: {payload}\n\n"
-                    last_total = current_total
+                    last_since = datetime.now(timezone.utc)
                 else:
-                    # Heartbeat — keeps connection alive
-                    yield f": heartbeat {datetime.utcnow().isoformat()}\n\n"
-            except GeneratorExit:
-                break
-            except Exception:
-                break
+                    yield ": ping\n\n"
+
+                await asyncio.sleep(25)
+        except asyncio.CancelledError:
+            pass
 
     return StreamingResponse(
         event_stream(),
@@ -154,7 +192,6 @@ async def get_updates_sse(
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
         },
     )
 
@@ -162,7 +199,7 @@ async def get_updates_sse(
 @router.get(
     "/search",
     response_model=SearchResponse,
-    summary="Search cached today stories",
+    summary="Search cached stories",
 )
 async def search_stories(
     q: str = Query(min_length=1, max_length=100),
@@ -170,44 +207,3 @@ async def search_stories(
 ):
     results = await db.search_stories(q, category=FeedCategory.today)
     return SearchResponse(stories=results, query=q, total=len(results))
-
-
-@router.get(
-    "/session",
-    response_model=UserSession,
-    summary="Get or create device session",
-)
-async def get_session(
-    device_id: str = Depends(_get_device_id),
-    _=Depends(require_read_access),
-):
-    """
-    Returns the stored session for this device (or creates a blank one).
-    Contains last_story_index, selected_topics, display_name, location_label.
-    Used on app cold start to restore state.
-    """
-    session_data = await db.get_or_create_session(device_id)
-    return UserSession(**session_data)
-
-
-@router.put(
-    "/session",
-    summary="Update device session state",
-)
-async def update_session(
-    body: SessionUpdateRequest,
-    device_id: str = Depends(_get_device_id),
-    _=Depends(require_read_access),
-):
-    """
-    Syncs session from device to server.
-    Called on every page change (debounced 500ms) and on topic filter change.
-    """
-    await db.update_session(
-        device_id=device_id,
-        last_story_index=body.last_story_index,
-        selected_topics=body.selected_topics,
-        display_name=body.display_name,
-        location_label=body.location_label,
-    )
-    return {"success": True}
