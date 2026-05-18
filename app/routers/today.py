@@ -123,6 +123,61 @@ async def get_feed_stats(
     )
 
 
+@router.put(
+    "/session",
+    summary="Persist session state — last viewed story index and optional read marker",
+)
+async def update_session(
+    request: Request,
+    tz: str = Query(default="UTC"),
+    _=Depends(require_read_access),
+):
+    """
+    Called by the Flutter app to:
+      - Record which story index the user last viewed (for resume-on-reopen).
+      - Optionally mark a story as read in the same call.
+
+    Request body (JSON, all fields optional):
+      {
+        "last_story_index": 6,
+        "story_id": "abc123"   // if present, also marks this story as read
+      }
+
+    Returns current session stats so the app can update its counters
+    in a single round-trip.
+
+    Note: last_story_index is informational — the backend acknowledges it
+    but story ordering is owned by the client. The value is echoed back
+    so the app can confirm receipt.
+    """
+    session_id = _session_id(request)
+    since = _since_cutoff(tz)
+
+    body: dict = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass  # empty body is fine — stats-only update
+
+    story_id: Optional[str] = body.get("story_id")
+    last_story_index: Optional[int] = body.get("last_story_index")
+
+    if story_id:
+        story = await db.get_story(story_id)
+        if story:
+            await db.mark_story_read_in_session(session_id, story_id)
+
+    stats = await db.get_session_stats(session_id, since_published=since)
+    return {
+        "session_id": session_id,
+        "last_story_index": last_story_index,
+        "read": stats["read"],
+        "unread": stats["unread"],
+        "total": stats["total"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.get(
     "/updates",
     summary="SSE stream — push new story events as they arrive in the cache",

@@ -33,10 +33,16 @@ async def mark_read(
     Scoped via X-Device-ID header so each device has its own read history.
     After this call, GET /v1/today will no longer return this story for the device.
     Also updates the global read flag for backward compatibility.
+
+    Fix: was calling db.mark_story_read_for_device which does not exist.
+    Correct function is db.mark_story_read_in_session (idempotent, returns None).
+    Guard against 404 by checking story existence separately.
     """
-    success = await db.mark_story_read_for_device(device_id, story_id)
-    if not success:
+    story = await db.get_story(story_id)
+    if not story:
         raise HTTPException(status_code=404, detail="Story not found")
+    # mark_story_read_in_session is idempotent and returns None
+    await db.mark_story_read_in_session(device_id, story_id)
     return ActionResponse(success=True, message="Marked as read")
 
 
