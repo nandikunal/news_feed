@@ -29,6 +29,7 @@ class TopicLabel(str, Enum):
     local = "local"
     entertainment = "entertainment"
     science = "science"
+    weather = "weather"
 
 
 class StoryCard(BaseModel):
