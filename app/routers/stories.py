@@ -1,9 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from app.core.security import require_read_access
 from app.models.schemas import StoryCard, ActionResponse
 from app.services import database as db
 
 router = APIRouter(prefix="/v1/stories", tags=["Story Actions"])
+
+
+def _get_session_id(request: Request) -> str:
+    """Extract X-Session-ID header; fall back to 'default' if absent."""
+    return request.headers.get("X-Session-ID", "default")
 
 
 @router.get(
@@ -21,11 +26,23 @@ async def get_story(story_id: str, _=Depends(require_read_access)):
 @router.post(
     "/{story_id}/read",
     response_model=ActionResponse,
-    summary="Mark story as read",
+    summary="Mark story as read (session-scoped)",
 )
-async def mark_read(story_id: str, _=Depends(require_read_access)):
-    if not await db.update_story_state(story_id, "read", True):
+async def mark_read(
+    story_id: str,
+    request: Request,
+    _=Depends(require_read_access),
+):
+    """
+    Records a read event for the current session.
+    - Updates the global read flag on the story row (for analytics).
+    - Stores (session_id, story_id) in session_reads so this story
+      is excluded from future GET /v1/today calls for this session.
+    """
+    if not await db.get_story(story_id):
         raise HTTPException(status_code=404, detail="Story not found")
+    session_id = _get_session_id(request)
+    await db.mark_story_read_for_session(session_id, story_id)
     return ActionResponse(success=True, message="Marked as read")
 
 

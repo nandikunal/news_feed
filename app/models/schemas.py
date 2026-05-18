@@ -33,7 +33,7 @@ class StoryCard(BaseModel):
     link: str
     image_url: str
     source: str
-    source_names: List[str] = []        # populated when multiple feeds report same story
+    source_names: List[str] = []
     published_at: Optional[datetime] = None
     topic: TopicLabel = TopicLabel.general
     read: bool = False
@@ -48,7 +48,7 @@ class FeedSource(BaseModel):
     url: str
     category: FeedCategory = FeedCategory.today
     active: bool = True
-    is_user_selectable: bool = True     # shown in onboarding picker
+    is_user_selectable: bool = True
     added_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -72,6 +72,16 @@ class SelectSourcesRequest(BaseModel):
 class ActionResponse(BaseModel):
     success: bool
     message: str
+
+
+# ── Stats model ───────────────────────────────────────────────────────────────
+
+class FeedStatsResponse(BaseModel):
+    """Read/unread/total counts for the current session — shown in drawer."""
+    read: int
+    unread: int
+    total: int
+    deduplicated_total: int
 
 
 # ── Response models with cache metadata ──────────────────────────────────────

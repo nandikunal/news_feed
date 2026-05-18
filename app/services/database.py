@@ -9,7 +9,7 @@ Redis can wrap get_stories / cache_stories as a read-through layer.
 import json
 import hashlib
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from typing import List, Optional, Dict
 from app.core.config import settings
@@ -51,6 +51,19 @@ async def init_db():
                 title_hash TEXT NOT NULL
             )
         """)
+        # Per-session read tracking — keyed by (session_id, story_id)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS session_reads (
+                session_id TEXT NOT NULL,
+                story_id   TEXT NOT NULL,
+                read_at    TEXT NOT NULL,
+                PRIMARY KEY (session_id, story_id)
+            )
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_reads_session
+            ON session_reads (session_id)
+        """)
         await db.execute("""
             CREATE INDEX IF NOT EXISTS idx_stories_category_published
             ON stories (category, published_at DESC)
@@ -78,6 +91,7 @@ async def clear_all():
         await db.execute("DELETE FROM feed_sources")
         await db.execute("DELETE FROM stories")
         await db.execute("DELETE FROM cache_meta")
+        await db.execute("DELETE FROM session_reads")
         await db.commit()
 
 
@@ -258,12 +272,29 @@ async def get_stories(
     category: Optional[FeedCategory] = None,
     page: int = 1,
     per_page: int = 5,
+    since_published: Optional[datetime] = None,
+    topics: Optional[List[str]] = None,
+    exclude_ids: Optional[List[str]] = None,
 ) -> List[StoryCard]:
+    """Fetch stories with optional timezone-aware date filter, topic filter,
+    and exclusion list (already-read story IDs for a session)."""
     query = "SELECT * FROM stories WHERE 1=1"
     params: list = []
     if category:
         query += " AND category = ?"
         params.append(category.value)
+    if since_published:
+        query += " AND published_at >= ?"
+        params.append(since_published.isoformat())
+    if topics:
+        placeholders = ",".join("?" * len(topics))
+        query += f" AND topic IN ({placeholders})"
+        params.extend(topics)
+    if exclude_ids:
+        # Exclude already-read stories for this session
+        placeholders = ",".join("?" * len(exclude_ids))
+        query += f" AND id NOT IN ({placeholders})"
+        params.extend(exclude_ids)
     query += " ORDER BY published_at DESC LIMIT ? OFFSET ?"
     params += [per_page, (page - 1) * per_page]
     async with aiosqlite.connect(_db_path) as db:
@@ -289,12 +320,18 @@ async def get_stories_since(
             return [_row_to_story(r) for r in rows]
 
 
-async def count_stories(category: Optional[FeedCategory] = None) -> int:
-    query = "SELECT COUNT(*) FROM stories"
+async def count_stories(
+    category: Optional[FeedCategory] = None,
+    since_published: Optional[datetime] = None,
+) -> int:
+    query = "SELECT COUNT(*) FROM stories WHERE 1=1"
     params: list = []
     if category:
-        query += " WHERE category = ?"
+        query += " AND category = ?"
         params.append(category.value)
+    if since_published:
+        query += " AND published_at >= ?"
+        params.append(since_published.isoformat())
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(query, params) as cur:
             row = await cur.fetchone()
@@ -372,3 +409,72 @@ async def search_stories(
         async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
             return [_row_to_story(r) for r in rows]
+
+
+# ── Session-based read tracking ───────────────────────────────────────────────
+
+async def mark_story_read_for_session(session_id: str, story_id: str) -> None:
+    """Record that a specific session has read a story.
+    Also updates the global read flag on the story row."""
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO session_reads (session_id, story_id, read_at)
+            VALUES (?, ?, ?)
+        """, (session_id, story_id, now))
+        # Also flip the global read flag for analytics
+        await db.execute(
+            "UPDATE stories SET read = 1 WHERE id = ?", (story_id,)
+        )
+        await db.commit()
+
+
+async def get_session_read_ids(session_id: str) -> List[str]:
+    """Return all story IDs already read by this session."""
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute(
+            "SELECT story_id FROM session_reads WHERE session_id = ?",
+            (session_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
+
+
+async def get_session_stats(
+    session_id: str,
+    since_published: Optional[datetime] = None,
+) -> dict:
+    """Return read/unread/total counts for a given session's today feed."""
+    total_query = "SELECT COUNT(*) FROM stories WHERE category = 'today'"
+    params_total: list = []
+    if since_published:
+        total_query += " AND published_at >= ?"
+        params_total.append(since_published.isoformat())
+
+    read_query = """
+        SELECT COUNT(*) FROM session_reads sr
+        JOIN stories s ON sr.story_id = s.id
+        WHERE sr.session_id = ? AND s.category = 'today'
+    """
+    params_read: list = [session_id]
+    if since_published:
+        read_query += " AND s.published_at >= ?"
+        params_read.append(since_published.isoformat())
+
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute(total_query, params_total) as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(read_query, params_read) as cur:
+            read = (await cur.fetchone())[0]
+
+    return {"total": total, "read": read, "unread": total - read}
+
+
+async def purge_old_session_reads(days: int = 2) -> None:
+    """Clean up session reads older than `days` days to keep DB lean."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute(
+            "DELETE FROM session_reads WHERE read_at < ?", (cutoff,)
+        )
+        await db.commit()
