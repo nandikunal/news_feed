@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional
 from enum import Enum
-from pydantic import BaseModel, HttpUrl, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class FeedCategory(str, Enum):
@@ -26,36 +26,47 @@ class TopicLabel(str, Enum):
     general = "general"
     economy = "economy"
     news = "news"
+    local = "local"
+    entertainment = "entertainment"
+    science = "science"
 
 
 class StoryCard(BaseModel):
     id: str
     title: str
     short_content: str
-    image_url: Optional[str] = None
     link: str
+    image_url: Optional[str] = None
     source: str
-    category: FeedCategory
-    topic: TopicLabel
+    source_names: List[str] = []
     published_at: Optional[datetime] = None
     cached_at: Optional[datetime] = None
+    topic: TopicLabel = TopicLabel.general
     read: bool = False
     liked: bool = False
     bookmarked: bool = False
+    category: FeedCategory = FeedCategory.today
 
 
-class FeedPreview(BaseModel):
+# ── Feed management models (used by feeds.py router) ──────────────────────────
+
+class FeedSource(BaseModel):
+    id: str
+    name: str
     url: str
-    title: Optional[str] = None
-    story_count: int = 0
-    sample_stories: List[StoryCard] = []
+    category: FeedCategory = FeedCategory.today
+    active: bool = True
+    is_user_selectable: bool = True
+    added_at: datetime = Field(default_factory=datetime.utcnow)
 
 
-class FeedCreate(BaseModel):
+class AddFeedRequest(BaseModel):
+    """Request body for POST /v1/feeds — register a new RSS feed."""
     url: str
     name: Optional[str] = None
     category: FeedCategory = FeedCategory.today
     topic: TopicLabel = TopicLabel.general
+    is_user_selectable: bool = True
 
     @field_validator('url')
     @classmethod
@@ -63,6 +74,24 @@ class FeedCreate(BaseModel):
         if not v.startswith(('http://', 'https://')):
             raise ValueError('URL must start with http:// or https://')
         return v
+
+
+class PreviewFeedRequest(BaseModel):
+    """Request body for POST /v1/feeds/preview — dry-run without saving."""
+    url: str
+    limit: int = 5
+
+    @field_validator('url')
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        if not v.startswith(('http://', 'https://')):
+            raise ValueError('URL must start with http:// or https://')
+        return v
+
+
+# Legacy alias — kept so any existing code using FeedCreate still works
+class FeedCreate(AddFeedRequest):
+    pass
 
 
 class FeedRecord(BaseModel):
@@ -77,9 +106,37 @@ class FeedRecord(BaseModel):
     is_active: bool = True
 
 
+class FeedPreview(BaseModel):
+    url: str
+    title: Optional[str] = None
+    story_count: int = 0
+    sample_stories: List[StoryCard] = []
+
+
+class SelectSourcesRequest(BaseModel):
+    source_ids: List[str]
+
+
 class ActionResponse(BaseModel):
     success: bool
     message: str = ""
+
+
+# ── Stats models ──────────────────────────────────────────────────────────────
+
+class FeedStatsResponse(BaseModel):
+    """Read/unread/total counts for today's stories (session-scoped).
+    Used by GET /v1/today/stats — shown in the app's left drawer.
+    """
+    read: int
+    unread: int
+    total: int
+    deduplicated_total: int
+
+
+# Alias with timestamp — Flutter models may use this name
+class StatsResponse(FeedStatsResponse):
+    as_of: datetime = Field(default_factory=datetime.utcnow)
 
 
 class SearchResponse(BaseModel):
@@ -105,13 +162,7 @@ class TodayFeedResponse(BaseModel):
     new_stories_available: bool = False
 
 
-class StatsResponse(BaseModel):
-    """Deduplicated read/unread/total counts for today's feed (device-scoped)."""
-    read: int
-    unread: int
-    total: int
-    deduplicated_total: int
-
+# ── Session models ────────────────────────────────────────────────────────────
 
 class UserSession(BaseModel):
     """Per-device session state."""
