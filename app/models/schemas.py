@@ -23,7 +23,13 @@ class TopicLabel(str, Enum):
     local = "local"
     entertainment = "entertainment"
     science = "science"
+    culture = "culture"
+    environment = "environment"
+    berlin = "berlin"
+    germany = "germany"
     general = "general"
+    economy = "economy"
+    news = "news"
 
 
 class StoryCard(BaseModel):
@@ -31,9 +37,9 @@ class StoryCard(BaseModel):
     title: str
     short_content: str
     link: str
-    image_url: str
+    image_url: Optional[str] = None
     source: str
-    source_names: List[str] = []        # populated when multiple feeds report same story
+    source_names: List[str] = []
     published_at: Optional[datetime] = None
     topic: TopicLabel = TopicLabel.general
     read: bool = False
@@ -42,13 +48,15 @@ class StoryCard(BaseModel):
     category: FeedCategory = FeedCategory.today
 
 
+# ── Feed management models (used by feeds.py router) ─────────────────────────
+
 class FeedSource(BaseModel):
     id: str
     name: str
     url: str
     category: FeedCategory = FeedCategory.today
     active: bool = True
-    is_user_selectable: bool = True     # shown in onboarding picker
+    is_user_selectable: bool = True
     added_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -71,10 +79,27 @@ class SelectSourcesRequest(BaseModel):
 
 class ActionResponse(BaseModel):
     success: bool
-    message: str
+    message: str = ""
 
 
-# ── Response models with cache metadata ──────────────────────────────────────
+# ── Stats models ──────────────────────────────────────────────────────────────
+
+class FeedStatsResponse(BaseModel):
+    """Read/unread/total counts for today's stories (session-scoped).
+    Used by GET /v1/today/stats — shown in the app's left drawer.
+    """
+    read: int
+    unread: int
+    total: int
+    deduplicated_total: int
+
+
+# Alias with timestamp — Flutter models use this name
+class StatsResponse(FeedStatsResponse):
+    as_of: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ── Response models ───────────────────────────────────────────────────────────
 
 class TodayFeedResponse(BaseModel):
     stories: List[StoryCard]
@@ -98,12 +123,3 @@ class SearchResponse(BaseModel):
     stories: List[StoryCard]
     query: str
     total: int
-
-
-class StatsResponse(BaseModel):
-    """Deduplicated read/unread/total counts for today's stories."""
-    read: int
-    unread: int
-    total: int
-    deduplicated_total: int
-    as_of: datetime

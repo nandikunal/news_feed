@@ -1,15 +1,15 @@
 """
 SQLite-backed persistence layer via aiosqlite.
-Structured for a clean swap to asyncpg/Postgres later:
-  - Replace aiosqlite.connect() with asyncpg connection pool
+
+Notes on future migration:
+  - Replace aiosqlite.connect() with asyncpg pool
   - Replace ? placeholders with $1, $2 ...
-  - Replace INSERT OR REPLACE with INSERT ... ON CONFLICT DO UPDATE
-Redis can wrap get_stories / cache_stories as a read-through layer.
+  - Replace INSERT OR REPLACE with ON CONFLICT DO UPDATE
 """
 import json
 import hashlib
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import List, Optional, Dict
 from app.core.config import settings
@@ -19,7 +19,6 @@ _db_path = settings.DB_PATH
 
 
 async def init_db():
-    """Create all tables and indexes. Safe to call multiple times (IF NOT EXISTS)."""
     async with aiosqlite.connect(_db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS feed_sources (
@@ -38,7 +37,7 @@ async def init_db():
                 title TEXT NOT NULL,
                 short_content TEXT NOT NULL,
                 link TEXT NOT NULL,
-                image_url TEXT NOT NULL,
+                image_url TEXT,
                 source TEXT NOT NULL,
                 source_names TEXT NOT NULL DEFAULT '[]',
                 published_at TEXT,
@@ -52,16 +51,12 @@ async def init_db():
             )
         """)
         await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stories_category_published
-            ON stories (category, published_at DESC)
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stories_title_hash
-            ON stories (title_hash)
-        """)
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stories_cached_at
-            ON stories (cached_at DESC)
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_id TEXT NOT NULL,
+                story_id TEXT NOT NULL,
+                read_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, story_id)
+            )
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cache_meta (
@@ -69,22 +64,38 @@ async def init_db():
                 value TEXT NOT NULL
             )
         """)
+        # Indexes
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stories_category_published
+            ON stories (category, published_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stories_cached_at
+            ON stories (cached_at DESC)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stories_title_hash
+            ON stories (title_hash)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sessions_session
+            ON user_sessions (session_id)
+        """)
         await db.commit()
 
 
 async def clear_all():
-    """Delete all feeds, stories, and cache metadata for a clean slate."""
     async with aiosqlite.connect(_db_path) as db:
         await db.execute("DELETE FROM feed_sources")
         await db.execute("DELETE FROM stories")
         await db.execute("DELETE FROM cache_meta")
+        await db.execute("DELETE FROM user_sessions")
         await db.commit()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _title_hash(title: str) -> str:
-    """Normalize title to a stable hash for dedup index lookups."""
     import re
     normalized = re.sub(r'[^a-z0-9 ]', '', title.lower())
     normalized = re.sub(r'\s+', ' ', normalized).strip()
@@ -127,7 +138,8 @@ async def add_feed(feed: FeedSource) -> FeedSource:
 async def get_feed(feed_id: str) -> Optional[FeedSource]:
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(
-            "SELECT * FROM feed_sources WHERE id = ?", (feed_id,)
+            "SELECT id, name, url, category, active, is_user_selectable, added_at "
+            "FROM feed_sources WHERE id = ?", (feed_id,)
         ) as cur:
             row = await cur.fetchone()
             if not row:
@@ -144,7 +156,7 @@ async def list_feeds(
     category: Optional[FeedCategory] = None,
     user_selectable_only: bool = False,
 ) -> List[FeedSource]:
-    query = "SELECT * FROM feed_sources WHERE active = 1"
+    query = "SELECT id, name, url, category, active, is_user_selectable, added_at FROM feed_sources WHERE active = 1"
     params: list = []
     if category:
         query += " AND category = ?"
@@ -173,24 +185,23 @@ async def delete_feed(feed_id: str) -> bool:
         return cur.rowcount > 0
 
 
-# ── Story cache with deduplication ───────────────────────────────────────────
+# ── Story cache with two-stage deduplication ──────────────────────────────────
 
 async def cache_stories(stories: List[StoryCard]):
     """
     Upsert with two-stage deduplication:
-    1. Exact ID (URL hash) match  → merge source_names only
-    2. Title-hash bucket + SequenceMatcher similarity  → merge source_names only
-    3. No match  → insert as new story
-    All stories sorted by published_at DESC at query time (index-backed).
+      1. Exact ID match  → merge source_names only
+      2. Title-hash bucket + SequenceMatcher  → merge source_names only
+      3. No match  → insert new
     """
-    now = datetime.utcnow().isoformat()
-    threshold = settings.DEDUP_TITLE_THRESHOLD
+    now = datetime.now(timezone.utc).isoformat()
+    threshold = getattr(settings, 'DEDUP_TITLE_THRESHOLD', 0.85)
 
     async with aiosqlite.connect(_db_path) as db:
         for story in stories:
             th = _title_hash(story.title)
 
-            # Stage 1 — exact ID collision
+            # Stage 1 — exact ID
             async with db.execute(
                 "SELECT id, source_names FROM stories WHERE id = ?", (story.id,)
             ) as cur:
@@ -206,13 +217,10 @@ async def cache_stories(stories: List[StoryCard]):
                 )
                 continue
 
-            # Stage 2 — title similarity within same title_hash bucket
+            # Stage 2 — title similarity
             async with db.execute(
-                """
-                SELECT id, title, source_names FROM stories
-                WHERE category = ? AND title_hash = ?
-                LIMIT 20
-                """,
+                "SELECT id, title, source_names FROM stories "
+                "WHERE category = ? AND title_hash = ? LIMIT 20",
                 (story.category.value, th)
             ) as cur:
                 candidates = await cur.fetchall()
@@ -240,13 +248,12 @@ async def cache_stories(stories: List[StoryCard]):
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?, ?)
                 """, (
                     story.id, story.title, story.short_content, story.link,
-                    story.image_url, story.source,
+                    story.image_url or "", story.source,
                     json.dumps([story.source]),
                     pub, story.topic.value,
                     story.category.value, now, th,
                 ))
 
-        # Stamp last_refresh_at
         await db.execute(
             "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('last_refresh_at', ?)",
             (now,)
@@ -258,40 +265,27 @@ async def get_stories(
     category: Optional[FeedCategory] = None,
     page: int = 1,
     per_page: int = 5,
+    since_published: Optional[datetime] = None,
+    topics: Optional[List[str]] = None,
+    exclude_ids: Optional[List[str]] = None,
 ) -> List[StoryCard]:
-    query = "SELECT * FROM stories WHERE 1=1"
+    """Fetch paginated stories with optional timezone cutoff, topic, and session exclude filters."""
+    query = "SELECT id, title, short_content, link, image_url, source, source_names, published_at, topic, read, liked, bookmarked, category FROM stories WHERE 1=1"
     params: list = []
     if category:
         query += " AND category = ?"
         params.append(category.value)
-    query += " ORDER BY published_at DESC LIMIT ? OFFSET ?"
-    params += [per_page, (page - 1) * per_page]
-    async with aiosqlite.connect(_db_path) as db:
-        async with db.execute(query, params) as cur:
-            rows = await cur.fetchall()
-            return [_row_to_story(r) for r in rows]
-
-
-async def get_stories_for_today(
-    category: Optional[FeedCategory] = None,
-    since: Optional[datetime] = None,
-    page: int = 1,
-    per_page: int = 5,
-    topics: Optional[List[TopicLabel]] = None,
-) -> List[StoryCard]:
-    """Timezone-aware story fetch: only returns stories published after `since` cutoff."""
-    query = "SELECT * FROM stories WHERE 1=1"
-    params: list = []
-    if category:
-        query += " AND category = ?"
-        params.append(category.value)
-    if since:
+    if since_published:
         query += " AND cached_at >= ?"
-        params.append(since.isoformat())
+        params.append(since_published.isoformat())
     if topics:
         placeholders = ",".join("?" * len(topics))
         query += f" AND topic IN ({placeholders})"
-        params.extend(t.value for t in topics)
+        params.extend(topics)
+    if exclude_ids:
+        placeholders = ",".join("?" * len(exclude_ids))
+        query += f" AND id NOT IN ({placeholders})"
+        params.extend(exclude_ids)
     query += " ORDER BY published_at DESC LIMIT ? OFFSET ?"
     params += [per_page, (page - 1) * per_page]
     async with aiosqlite.connect(_db_path) as db:
@@ -300,28 +294,27 @@ async def get_stories_for_today(
             return [_row_to_story(r) for r in rows]
 
 
-async def count_stories_for_today(
+async def count_stories(
     category: Optional[FeedCategory] = None,
-    since: Optional[datetime] = None,
-    topics: Optional[List[TopicLabel]] = None,
-    read_filter: Optional[bool] = None,
+    since_published: Optional[datetime] = None,
+    topics: Optional[List[str]] = None,
+    read_only: Optional[bool] = None,
 ) -> int:
-    """Count deduplicated stories for today, with optional read and topic filters."""
     query = "SELECT COUNT(*) FROM stories WHERE 1=1"
     params: list = []
     if category:
         query += " AND category = ?"
         params.append(category.value)
-    if since:
+    if since_published:
         query += " AND cached_at >= ?"
-        params.append(since.isoformat())
+        params.append(since_published.isoformat())
     if topics:
         placeholders = ",".join("?" * len(topics))
         query += f" AND topic IN ({placeholders})"
-        params.extend(t.value for t in topics)
-    if read_filter is not None:
+        params.extend(topics)
+    if read_only is not None:
         query += " AND read = ?"
-        params.append(int(read_filter))
+        params.append(int(read_only))
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(query, params) as cur:
             row = await cur.fetchone()
@@ -332,8 +325,8 @@ async def get_stories_since(
     since: datetime,
     category: Optional[FeedCategory] = None,
 ) -> List[StoryCard]:
-    """For the /v1/today/updates SSE endpoint — incremental polling."""
-    query = "SELECT * FROM stories WHERE cached_at > ?"
+    """Incremental SSE polling — returns stories cached after `since`."""
+    query = "SELECT id, title, short_content, link, image_url, source, source_names, published_at, topic, read, liked, bookmarked, category FROM stories WHERE cached_at > ?"
     params: list = [since.isoformat()]
     if category:
         query += " AND category = ?"
@@ -345,33 +338,76 @@ async def get_stories_since(
             return [_row_to_story(r) for r in rows]
 
 
-async def count_stories(category: Optional[FeedCategory] = None) -> int:
-    query = "SELECT COUNT(*) FROM stories"
-    params: list = []
-    if category:
-        query += " WHERE category = ?"
-        params.append(category.value)
+# ── Session management (per-device read state) ────────────────────────────────
+
+async def mark_story_read_in_session(session_id: str, story_id: str) -> None:
+    """Record that a device-session has read a story. Idempotent."""
+    now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(_db_path) as db:
-        async with db.execute(query, params) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+        await db.execute("""
+            INSERT OR IGNORE INTO user_sessions (session_id, story_id, read_at)
+            VALUES (?, ?, ?)
+        """, (session_id, story_id, now))
+        await db.commit()
 
 
-async def get_cache_meta() -> Dict:
+async def get_session_read_ids(session_id: str) -> List[str]:
+    """Return all story IDs read by a session (used to filter /v1/today hide_read)."""
     async with aiosqlite.connect(_db_path) as db:
-        async with db.execute("SELECT key, value FROM cache_meta") as cur:
+        async with db.execute(
+            "SELECT story_id FROM user_sessions WHERE session_id = ?",
+            (session_id,)
+        ) as cur:
             rows = await cur.fetchall()
-            meta = {r[0]: r[1] for r in rows}
-            raw = meta.get("last_refresh_at")
-            return {
-                "last_refresh_at": datetime.fromisoformat(raw) if raw else None,
-            }
+            return [r[0] for r in rows]
 
+
+async def get_session_stats(
+    session_id: str,
+    since_published: Optional[datetime] = None,
+) -> Dict:
+    """Return read/unread/total counts for today's stories, scoped to a session."""
+    # Total deduplicated stories for today
+    total = await count_stories(
+        category=FeedCategory.today,
+        since_published=since_published,
+    )
+    # Stories read by this session
+    read_ids = await get_session_read_ids(session_id)
+    # Cross-reference: only count reads for stories that are still in today's pool
+    if not read_ids:
+        read_count = 0
+    else:
+        placeholders = ",".join("?" * len(read_ids))
+        base_params: list = read_ids
+        extra = ""
+        if since_published:
+            extra = " AND cached_at >= ?"
+            base_params = read_ids + [since_published.isoformat()]
+        async with aiosqlite.connect(_db_path) as db:
+            async with db.execute(
+                f"SELECT COUNT(*) FROM stories WHERE id IN ({placeholders})"
+                f" AND category = 'today'{extra}",
+                base_params
+            ) as cur:
+                row = await cur.fetchone()
+                read_count = row[0] if row else 0
+
+    return {
+        "read": read_count,
+        "unread": max(0, total - read_count),
+        "total": total,
+    }
+
+
+# ── Story state (global flags — bookmarks/likes persist across sessions) ──────
 
 async def get_story(story_id: str) -> Optional[StoryCard]:
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(
-            "SELECT * FROM stories WHERE id = ?", (story_id,)
+            "SELECT id, title, short_content, link, image_url, source, source_names, "
+            "published_at, topic, read, liked, bookmarked, category FROM stories WHERE id = ?",
+            (story_id,)
         ) as cur:
             row = await cur.fetchone()
             return _row_to_story(row) if row else None
@@ -415,10 +451,11 @@ async def search_stories(
     category: Optional[FeedCategory] = None,
 ) -> List[StoryCard]:
     q = f"%{query.lower()}%"
-    sql = """
-        SELECT * FROM stories
-        WHERE (lower(title) LIKE ? OR lower(short_content) LIKE ? OR lower(source) LIKE ?)
-    """
+    sql = (
+        "SELECT id, title, short_content, link, image_url, source, source_names, "
+        "published_at, topic, read, liked, bookmarked, category FROM stories "
+        "WHERE (lower(title) LIKE ? OR lower(short_content) LIKE ? OR lower(source) LIKE ?)"
+    )
     params: list = [q, q, q]
     if category:
         sql += " AND category = ?"
@@ -428,3 +465,14 @@ async def search_stories(
         async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
             return [_row_to_story(r) for r in rows]
+
+
+async def get_cache_meta() -> Dict:
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute("SELECT key, value FROM cache_meta") as cur:
+            rows = await cur.fetchall()
+            meta = {r[0]: r[1] for r in rows}
+            raw = meta.get("last_refresh_at")
+            return {
+                "last_refresh_at": datetime.fromisoformat(raw) if raw else None,
+            }
