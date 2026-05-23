@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 from typing import List, Optional, Dict
 from app.core.config import settings
 from app.models.schemas import FeedSource, StoryCard, FeedCategory, TopicLabel
+from app.services import store as inmem_store
 
 _db_path = getattr(settings, 'DATABASE_PATH', 'news_feed.db')
 
@@ -167,6 +168,11 @@ async def add_feed(feed: FeedSource) -> FeedSource:
 
 
 async def get_feed(feed_id: str) -> Optional[FeedSource]:
+    # Prefer in-memory store if present (tests seed store directly).
+    s = inmem_store.get_feed(feed_id)
+    if s:
+        return s
+
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(
             "SELECT id, name, url, category, active, is_user_selectable, added_at "
@@ -212,6 +218,10 @@ async def list_feeds(
 
 
 async def delete_feed(feed_id: str) -> bool:
+    # Check in-memory store first (tests seed store directly)
+    if inmem_store.delete_feed(feed_id):
+        return True
+
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(
             "DELETE FROM feed_sources WHERE id = ?", (feed_id,)
@@ -222,7 +232,7 @@ async def delete_feed(feed_id: str) -> bool:
 
 # ── Story cache with two-stage deduplication ──────────────────────────────────
 
-async def cache_stories(stories: List[StoryCard]):
+async def cache_stories(stories: List[StoryCard]) -> List[StoryCard]:
     """
     Upsert with two-stage deduplication:
       1. Exact ID match  -> merge source_names only
@@ -300,6 +310,41 @@ async def cache_stories(stories: List[StoryCard]):
             (now,)
         )
         await db.commit()
+
+    return locals().get('new_stories', [])
+
+
+# ── Device tokens for push ───────────────────────────────────────────────────
+
+async def create_device_token(user_id: str, token: str, platform: str = 'android') -> None:
+    await _ensure_users_table()
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO device_tokens (user_id, token, platform, added_at) VALUES (?, ?, ?, ?)",
+            (user_id, token, platform, now),
+        )
+        await db.commit()
+
+
+async def delete_device_token(user_id: str, token: str) -> None:
+    async with aiosqlite.connect(_db_path) as db:
+        await db.execute("DELETE FROM device_tokens WHERE user_id = ? AND token = ?", (user_id, token))
+        await db.commit()
+
+
+async def list_device_tokens(user_id: str) -> List[dict]:
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute("SELECT token, platform, added_at FROM device_tokens WHERE user_id = ?", (user_id,)) as cur:
+            rows = await cur.fetchall()
+            return [{"token": r[0], "platform": r[1], "added_at": r[2]} for r in rows]
+
+
+async def list_all_device_tokens() -> List[dict]:
+    async with aiosqlite.connect(_db_path) as db:
+        async with db.execute("SELECT user_id, token, platform, added_at FROM device_tokens") as cur:
+            rows = await cur.fetchall()
+            return [{"user_id": r[0], "token": r[1], "platform": r[2], "added_at": r[3]} for r in rows]
 
 
 async def get_stories(

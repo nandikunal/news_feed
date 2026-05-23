@@ -92,3 +92,34 @@ All endpoints (except `/` and `/health`) require the `X-API-Key` header.
 ```bash
 pytest -v
 ```
+
+## Quickstart (Auth + Push)
+- POST /v1/auth/register {email,password} → 200 (user created)
+- POST /v1/auth/login {email,password} → {access_token, token_type}
+- Use Authorization: Bearer <token> for user-scoped actions and X-API-Key for read/admin access.
+- After login, POST /v1/push/register {token,platform} with Bearer to register device for push.
+
+## Key endpoints (minimal usage)
+- GET /v1/today?per_page=20&page=1  (requires X-API-Key)
+- GET /v1/today/search?q=term  (requires X-API-Key)
+- GET /v1/stories/{id}  (returns per-user state when Bearer present)
+- POST /v1/stories/{id}/read|/like|/bookmark  (toggle actions, X-API-Key or Bearer)
+- POST /v1/feeds  (admin: add feed; enqueues background refresh)
+- POST /v1/feeds/{feed_id}/refresh (admin: force refresh)
+- POST /v1/push/register and /v1/push/unregister (user device token management)
+
+## Architecture (brief)
+- FastAPI app (app/main.py) with routers: today, stories, feeds, auth, push, internal.
+- Persistence: aiosqlite-backed DB (app/services/database.py) + in-memory store for tests.
+- Background refresh: scheduler and refresh jobs (refresh_jobs table) with retry/backoff.
+- IAM: JWT-based auth (app/services/auth.py) + X-API-Key gates for read/admin/internal.
+- Push: FCM legacy HTTP integration (app/services/push.py) triggered after new stories inserted.
+
+## Sequence flow (add feed → refresh → notify)
+1. Admin POST /v1/feeds (adds feed) → server creates feed row + refresh_job row.
+2. Background worker picks job → fetches feed → cache_stories inserts new stories.
+3. cache_stories returns new_stories list → push.notify_new_stories sends notifications to registered device tokens.
+4. Refresh job status updated (success/failed). Retries scheduled with exponential backoff.
+
+## Regenerate OpenAPI used by /docs
+- A generator is included: `python3 scripts/generate_openapi.py` writes `docs/openapi.json` from the running FastAPI app schema.

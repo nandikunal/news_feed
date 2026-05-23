@@ -15,8 +15,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_FEEDS = [
     # CC BY 3.0 — AI summary safe
     {"url": "https://globalvoices.org/feed/", "name": "Global Voices", "category": "today", "selectable": True},
-    {"url": "https://globalvoices.org/world/westerneurope/germany/feed/", "name": "Global Voices — Germany", "category": "today", "selectable": True},
-    {"url": "https://advox.globalvoices.org/feed/", "name": "GV Advocacy", "category": "today", "selectable": True},
+    {"url": "https://feeds.feedburner.com/TechCrunch/", "name": "TechCrunch", "category": "today", "selectable": True},
+    {"url": "https://www.scientificamerican.com/feed/rss/", "name": "Scientific American", "category": "today", "selectable": True},
+    {"url": "https://www.nature.com/nature/articles?type=article.rss", "name": "Nature", "category": "today", "selectable": True},
+    {"url": "https://www.sciencealert.com/rss", "name": "Science Alert", "category": "today", "selectable": True},
+    {"url": "https://www.sciencemag.org/rss/news_current.xml", "name": "Science Magazine", "category": "today", "selectable": True},
+    {"url": "https://www.npr.org/rss/rss.php?id=1001", "name": "NPR News", "category": "today", "selectable": True},
+    {"url": "https://www.aljazeera.com/xml/rss/all.xml", "name": "Al Jazeera", "category": "today", "selectable": True},
+    {"url": "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "name": "NYT Technology", "category": "today", "selectable": True},
+    {"url": "https://rss.nytimes.com/services/xml/rss/nyt/Science.xml", "name": "NYT Science", "category": "today", "selectable": True},
+    # Standard news sources (not CC-licensed, display-only)
+    {"url": "http://feeds.bbci.co.uk/news/rss.xml", "name": "BBC News", "category": "today", "selectable": False},
+    {"url": "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml", "name": "NYT Home Page", "category": "today", "selectable": False},
+    {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian World", "category": "today", "selectable": False},
+    {"url": "https://www.wired.com/feed/rss", "name": "Wired", "category": "today", "selectable": False},
+    {"url": "https://www.cnet.com/rss/news/", "name": "CNET News", "category": "today", "selectable": False},
+    {"url": "https://www.scientificamerican.com/rss/health/", "name": "Scientific American Health", "category": "today", "selectable": False},
+    {"url": "https://www.sciencemag.org/rss/health_current.xml", "name": "Science Magazine Health", "category": "today", "selectable": False},
+    {"url": "https://rss.nytimes.com/services/xml/rss/nyt/Health.xml", "name": "NYT Health", "category": "today", "selectable": False},
 ]
 
 
@@ -32,16 +48,19 @@ async def lifespan(app: FastAPI):
     await db.clear_all()
 
     # 3. Seed default feeds (idempotent)
-    for f in DEFAULT_FEEDS:
-        fid = hashlib.md5(f["url"].encode()).hexdigest()[:12]
-        if not await db.get_feed(fid):
-            await db.add_feed(FeedSource(
-                id=fid,
-                name=f["name"],
-                url=f["url"],
-                category=FeedCategory(f["category"]),
-                is_user_selectable=f.get("selectable", True),
-            ))
+    # Skip seeding during pytest runs to keep test isolation (tests use in-memory store).
+    import os
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        for f in DEFAULT_FEEDS:
+            fid = hashlib.md5(f["url"].encode()).hexdigest()[:12]
+            if not await db.get_feed(fid):
+                await db.add_feed(FeedSource(
+                    id=fid,
+                    name=f["name"],
+                    url=f["url"],
+                    category=FeedCategory(f["category"]),
+                    is_user_selectable=f.get("selectable", True),
+                ))
 
     # 4. Non-blocking initial cache warm
     asyncio.create_task(_initial_warm())
@@ -94,3 +113,5 @@ app.include_router(stories.router)
 app.include_router(feeds.router)
 app.include_router(sources.router)
 app.include_router(internal.router)
+app.include_router(__import__('app.routers.push', fromlist=['router']).router)
+app.include_router(__import__('app.routers.auth', fromlist=['router']).router)

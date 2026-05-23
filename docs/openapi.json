@@ -1,0 +1,1649 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RSS News API",
+    "description": "Swipe-card RSS backend for a TikTok-style news app.\n\nPass `X-API-Key` header on every request.\n\n- **Read key** (`API_KEY`): Today tab, search, story actions, source list\n- **Admin key** (`ADMIN_API_KEY`): Feed management\n- **Internal key** (`INTERNAL_REFRESH_KEY`): Cron-triggered refresh\n",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Root",
+        "description": "Confirms routing is alive.",
+        "operationId": "root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Health check",
+        "description": "Confirms app is up. Used by hosting platforms (Render, etc.).",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/today": {
+      "get": {
+        "tags": [
+          "Today Tab"
+        ],
+        "summary": "Get Today stories (paginated, from DB cache)",
+        "description": "Always served from DB \u2014 never fetches live RSS at request time.\nCache is refreshed by Render cron job every 15 min (prod)\nor APScheduler every 10 min (dev).\n\nFlutter usage:\n  - Launch:      GET /v1/today?page=1&per_page=5\n  - Scroll end:  GET /v1/today?page=2&per_page=10\n  - App resume:  GET /v1/today/updates?since=<last_cached_at>",
+        "operationId": "get_today_stories_v1_today_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 20,
+              "minimum": 1,
+              "default": 5,
+              "title": "Per Page"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TodayFeedResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/today/updates": {
+      "get": {
+        "tags": [
+          "Today Tab"
+        ],
+        "summary": "Poll for new stories since a timestamp",
+        "description": "Incremental polling endpoint.\nFlutter calls this when the app resumes from background.\nReturns only stories added to the cache after `since`.\nKeeps the payload minimal \u2014 avoids re-downloading the full feed.",
+        "operationId": "get_updates_v1_today_updates_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "description": "ISO 8601 timestamp \u2014 app sends its last known cached_at value",
+              "title": "Since"
+            },
+            "description": "ISO 8601 timestamp \u2014 app sends its last known cached_at value"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpdatesResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/today/search": {
+      "get": {
+        "tags": [
+          "Today Tab"
+        ],
+        "summary": "Search cached stories",
+        "operationId": "search_stories_v1_today_search_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "description": "Search term",
+              "title": "Q"
+            },
+            "description": "Search term"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/stories/{story_id}": {
+      "get": {
+        "tags": [
+          "Story Actions"
+        ],
+        "summary": "Get full story detail",
+        "operationId": "get_story_v1_stories__story_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "story_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Story Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoryCard"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/stories/{story_id}/read": {
+      "post": {
+        "tags": [
+          "Story Actions"
+        ],
+        "summary": "Mark story as read",
+        "operationId": "mark_read_v1_stories__story_id__read_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "story_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Story Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/stories/{story_id}/like": {
+      "post": {
+        "tags": [
+          "Story Actions"
+        ],
+        "summary": "Toggle like on a story",
+        "operationId": "like_story_v1_stories__story_id__like_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "story_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Story Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/stories/{story_id}/bookmark": {
+      "post": {
+        "tags": [
+          "Story Actions"
+        ],
+        "summary": "Toggle bookmark on a story",
+        "operationId": "bookmark_story_v1_stories__story_id__bookmark_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          },
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "story_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Story Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feeds/refresh-jobs": {
+      "get": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "List refresh jobs (admin only)",
+        "operationId": "list_refresh_jobs_v1_feeds_refresh_jobs_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RefreshJob"
+                  },
+                  "title": "Response List Refresh Jobs V1 Feeds Refresh Jobs Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feeds/refresh-jobs/{job_id}": {
+      "get": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "Get a refresh job by id (admin only)",
+        "operationId": "get_refresh_job_v1_feeds_refresh_jobs__job_id__get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshJob"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feeds/refresh-jobs/{job_id}/retry": {
+      "post": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "Retry a failed refresh job (admin only)",
+        "operationId": "retry_refresh_job_v1_feeds_refresh_jobs__job_id__retry_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feeds/preview": {
+      "post": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "Preview a feed without saving",
+        "description": "Fetch and normalise an RSS/Atom feed without persisting it.",
+        "operationId": "preview_feed_v1_feeds_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewFeedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StoryCard"
+                  },
+                  "type": "array",
+                  "title": "Response Preview Feed V1 Feeds Preview Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/feeds": {
+      "post": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "Add a new RSS feed",
+        "description": "Register an RSS/Atom feed. Enqueue an asynchronous refresh job after saving.\n\nThe route returns immediately with the created feed (201). The actual fetch\nand cache persistence happens in the background to avoid long admin-request latency.",
+        "operationId": "add_feed_v1_feeds_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddFeedRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeedSource"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "List all registered feeds",
+        "operationId": "list_feeds_v1_feeds_get",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/FeedCategory"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FeedSource"
+                  },
+                  "title": "Response List Feeds V1 Feeds Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feeds/{feed_id}": {
+      "delete": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "Remove a feed by ID",
+        "operationId": "delete_feed_v1_feeds__feed_id__delete",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "feed_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Feed Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/feeds/{feed_id}/refresh": {
+      "post": {
+        "tags": [
+          "Feed Management"
+        ],
+        "summary": "Force refresh a specific feed",
+        "description": "Force-fetch a single feed and update the story cache immediately.",
+        "operationId": "refresh_feed_v1_feeds__feed_id__refresh_post",
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "feed_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Feed Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/sources": {
+      "get": {
+        "tags": [
+          "Source Selection"
+        ],
+        "summary": "List user-selectable RSS sources (onboarding screen)",
+        "description": "Called by the Flutter onboarding screen to populate the source picker.\nReturns only feeds marked is_user_selectable=True.",
+        "operationId": "list_selectable_sources_v1_sources_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/FeedSource"
+                  },
+                  "type": "array",
+                  "title": "Response List Selectable Sources V1 Sources Get"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/sources/select": {
+      "post": {
+        "tags": [
+          "Source Selection"
+        ],
+        "summary": "Submit user's chosen feed IDs after onboarding",
+        "description": "Called once after the user finishes the onboarding source picker.\n\nFlow:\n  1. Validate all feed IDs exist.\n  2. Immediately fetch only the selected feeds (fast \u2014 2-5 feeds).\n  3. Store stories in DB cache.\n  4. Flutter can call GET /v1/today?page=1&per_page=5 right after.\n\nNote: In a multi-user setup, persist (user_id -> feed_ids) in a\nuser_preferences table and filter get_stories() by feed source.\nThe DB schema is ready for this extension.",
+        "operationId": "select_sources_v1_sources_select_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SelectSourcesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/refresh": {
+      "post": {
+        "tags": [
+          "Internal"
+        ],
+        "summary": "Trigger RSS refresh (cron / admin only)",
+        "description": "Fetches all active feeds, deduplicates stories, and updates the DB cache.\nCalled by Render cron every 15 min in production.\nCan also be called manually by an admin for an immediate refresh.",
+        "operationId": "trigger_refresh_v1_internal_refresh_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "APIKeyHeader": []
+          }
+        ]
+      }
+    },
+    "/v1/push/register": {
+      "post": {
+        "tags": [
+          "Push"
+        ],
+        "summary": "Register Token",
+        "operationId": "register_token_v1_push_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/push/unregister": {
+      "post": {
+        "tags": [
+          "Push"
+        ],
+        "summary": "Unregister Token",
+        "operationId": "unregister_token_v1_push_unregister_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnregisterTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/auth/register": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Register",
+        "operationId": "register_v1_auth_register_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Login",
+        "operationId": "login_v1_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActionResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "message"
+        ],
+        "title": "ActionResponse"
+      },
+      "AddFeedRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url",
+            "description": "Full RSS/Atom feed URL"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name",
+            "description": "Display name (auto-detected if omitted)"
+          },
+          "category": {
+            "$ref": "#/components/schemas/FeedCategory",
+            "default": "today"
+          },
+          "is_user_selectable": {
+            "type": "boolean",
+            "title": "Is User Selectable",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "AddFeedRequest"
+      },
+      "FeedCategory": {
+        "type": "string",
+        "enum": [
+          "today",
+          "critical",
+          "city",
+          "events",
+          "ai_brief"
+        ],
+        "title": "FeedCategory"
+      },
+      "FeedSource": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "category": {
+            "$ref": "#/components/schemas/FeedCategory",
+            "default": "today"
+          },
+          "active": {
+            "type": "boolean",
+            "title": "Active",
+            "default": true
+          },
+          "is_user_selectable": {
+            "type": "boolean",
+            "title": "Is User Selectable",
+            "default": true
+          },
+          "added_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Added At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "url"
+        ],
+        "title": "FeedSource"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "LoginRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "LoginRequest"
+      },
+      "PreviewFeedRequest": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url",
+            "description": "RSS/Atom feed URL to preview"
+          },
+          "limit": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "default": 10
+          }
+        },
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "title": "PreviewFeedRequest"
+      },
+      "RefreshJob": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "feed_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Feed Id"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RefreshJobStatus"
+          },
+          "queued_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Queued At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "queued_at"
+        ],
+        "title": "RefreshJob"
+      },
+      "RefreshJobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "success",
+          "failed"
+        ],
+        "title": "RefreshJobStatus"
+      },
+      "RegisterRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "title": "Email"
+          },
+          "password": {
+            "type": "string",
+            "title": "Password"
+          }
+        },
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "title": "RegisterRequest"
+      },
+      "RegisterTokenRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          },
+          "platform": {
+            "type": "string",
+            "title": "Platform",
+            "default": "android"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "RegisterTokenRequest"
+      },
+      "SearchResponse": {
+        "properties": {
+          "stories": {
+            "items": {
+              "$ref": "#/components/schemas/StoryCard"
+            },
+            "type": "array",
+            "title": "Stories"
+          },
+          "query": {
+            "type": "string",
+            "title": "Query"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stories",
+          "query",
+          "total"
+        ],
+        "title": "SearchResponse"
+      },
+      "SelectSourcesRequest": {
+        "properties": {
+          "feed_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 5,
+            "minItems": 2,
+            "title": "Feed Ids"
+          }
+        },
+        "type": "object",
+        "required": [
+          "feed_ids"
+        ],
+        "title": "SelectSourcesRequest",
+        "description": "Sent by Flutter app during onboarding \u2014 user picks 2\u20135 feeds."
+      },
+      "StoryCard": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "short_content": {
+            "type": "string",
+            "title": "Short Content"
+          },
+          "link": {
+            "type": "string",
+            "title": "Link"
+          },
+          "image_url": {
+            "type": "string",
+            "title": "Image Url"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "source_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Source Names",
+            "default": []
+          },
+          "published_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published At"
+          },
+          "topic": {
+            "$ref": "#/components/schemas/TopicLabel",
+            "default": "general"
+          },
+          "read": {
+            "type": "boolean",
+            "title": "Read",
+            "default": false
+          },
+          "liked": {
+            "type": "boolean",
+            "title": "Liked",
+            "default": false
+          },
+          "bookmarked": {
+            "type": "boolean",
+            "title": "Bookmarked",
+            "default": false
+          },
+          "category": {
+            "$ref": "#/components/schemas/FeedCategory",
+            "default": "today"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "short_content",
+          "link",
+          "image_url",
+          "source"
+        ],
+        "title": "StoryCard"
+      },
+      "TodayFeedResponse": {
+        "properties": {
+          "stories": {
+            "items": {
+              "$ref": "#/components/schemas/StoryCard"
+            },
+            "type": "array",
+            "title": "Stories"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "per_page": {
+            "type": "integer",
+            "title": "Per Page"
+          },
+          "cached_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cached At"
+          },
+          "last_refresh_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Refresh At"
+          },
+          "from_cache": {
+            "type": "boolean",
+            "title": "From Cache",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "stories",
+          "total",
+          "page",
+          "per_page"
+        ],
+        "title": "TodayFeedResponse"
+      },
+      "TopicLabel": {
+        "type": "string",
+        "enum": [
+          "politics",
+          "health",
+          "tech",
+          "finance",
+          "sports",
+          "transport",
+          "weather",
+          "local",
+          "entertainment",
+          "science",
+          "general"
+        ],
+        "title": "TopicLabel"
+      },
+      "UnregisterTokenRequest": {
+        "properties": {
+          "token": {
+            "type": "string",
+            "title": "Token"
+          }
+        },
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "title": "UnregisterTokenRequest"
+      },
+      "UpdatesResponse": {
+        "properties": {
+          "stories": {
+            "items": {
+              "$ref": "#/components/schemas/StoryCard"
+            },
+            "type": "array",
+            "title": "Stories"
+          },
+          "total_new": {
+            "type": "integer",
+            "title": "Total New"
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Since"
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Checked At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "stories",
+          "total_new",
+          "since",
+          "checked_at"
+        ],
+        "title": "UpdatesResponse",
+        "description": "Returns only stories added to cache after `since` timestamp."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "APIKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      },
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}
