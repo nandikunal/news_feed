@@ -33,10 +33,17 @@ async def _refresh_feed_bg(feed_id: str, url: str, category: FeedCategory, job_i
         if job_id:
             await db.update_refresh_job_status(job_id, 'running')
         cards = await parse_feed(url, category=category)
-        await db.cache_stories(cards)
-        logger.info(f"Background refresh for feed {feed_id} processed {len(cards)} stories.")
+        new_stories = await db.cache_stories(cards)
+        logger.info(f"Background refresh for feed {feed_id} processed {len(cards)} stories; {len(new_stories)} new.")
         if job_id:
-            await db.update_refresh_job_status(job_id, 'success', result=f"Processed {len(cards)} stories")
+            await db.update_refresh_job_status(job_id, 'success', result=f"Processed {len(cards)} stories; {len(new_stories)} new")
+        # fire push notifications for newly inserted stories
+        if new_stories:
+            try:
+                from app.services import push as push_service
+                await push_service.notify_new_stories(new_stories)
+            except Exception:
+                logger.exception("Failed to send push notifications for new stories")
     except Exception as e:
         logger.exception(f"Background refresh failed for feed {feed_id}: {e}")
         if job_id:
@@ -148,6 +155,7 @@ async def add_feed(body: AddFeedRequest, _=Depends(require_admin_access)):
     try:
         job_id = uuid.uuid4().hex[:12]
         await db.create_refresh_job(job_id, created.id)
+        # enqueue background refresh
         asyncio.create_task(_refresh_feed_bg(created.id, created.url, created.category, job_id))
     except Exception as e:
         logger.warning(f"Failed to enqueue background refresh for feed {created.id}: {e}")

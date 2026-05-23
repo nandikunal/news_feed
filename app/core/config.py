@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "dev-secret-key"  # override in production
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
 
+    # FCM push settings
+    FCM_SERVER_KEY: str = ""  # set in production for push
+    FCM_ENDPOINT: str = "https://fcm.googleapis.com/fcm/send"
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",")]
