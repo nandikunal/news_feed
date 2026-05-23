@@ -26,13 +26,16 @@ async def refresh_all_feeds():
         return_exceptions=True,
     )
     total = 0
+    new_stories_batches = []
     for r in results:
         if isinstance(r, list):
-            await db.cache_stories(r)
+            new = await db.cache_stories(r)
+            new_stories_batches.append(new)
             total += len(r)
         elif isinstance(r, Exception):
             logger.warning(f"Feed parse error: {r}")
     logger.info(f"Refresh complete — {total} raw stories processed.")
+    return new_stories_batches
 
 
 def start_apscheduler():

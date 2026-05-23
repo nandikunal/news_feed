@@ -163,6 +163,24 @@ class TodayFeedResponse(BaseModel):
     new_stories_available: bool = False
 
 
+class RefreshJobStatus(str, Enum):
+    queued = "queued"
+    running = "running"
+    success = "success"
+    failed = "failed"
+
+
+class RefreshJob(BaseModel):
+    id: str
+    feed_id: Optional[str] = None
+    status: RefreshJobStatus
+    queued_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    result: Optional[str] = None
+    attempts: int = 0
+
+
 # ── Session models ────────────────────────────────────────────────────────────
 
 class UserSession(BaseModel):

@@ -106,3 +106,46 @@ Widget build(BuildContext context) {
 
 Do **not** poll `/v1/today` on a timer — use `/v1/today/updates` on app resume instead.
 The backend cron handles freshness; the app just reacts when it comes to foreground.
+
+---
+
+## Auth (JWT) and Push Integration
+
+The backend now supports user accounts and JWT auth alongside the existing X-API-Key model. The Flutter app should:
+
+1. Register / Login
+   - POST /v1/auth/register  -> { "email": "...", "password": "..." }
+   - POST /v1/auth/login     -> { "email": "...", "password": "..." }
+     - Response: { "access_token": "<jwt>", "token_type": "bearer" }
+   - Store the access_token securely on device (Keychain/Keystore).
+
+2. Use both headers where appropriate
+   - Continue sending X-API-Key (read key) for read-only endpoints if used by pre-login flows.
+   - For user-scoped actions (read/like/bookmark, push token register), send Authorization: Bearer <access_token>.
+   - When Authorization (Bearer) is present, endpoints such as GET /v1/stories/{id} return per-user state (read/liked/bookmarked). When absent, global/cache-level flags are returned.
+
+3. Push registration flow
+   - After login, obtain device push token (FCM/APNs) on the device.
+   - POST /v1/push/register with Bearer token and body { "token": "<device-token>", "platform": "android" }
+   - To remove: POST /v1/push/unregister { "token": "<device-token>" }
+   - The server stores device tokens and dispatches notifications when new stories are ingested.
+
+4. Practical notes for Flutter
+   - Call /v1/auth/login once during onboarding or when user signs up.
+   - After receiving JWT, immediately call /v1/push/register to opt-in for notifications.
+   - Use the access token for user-specific actions (mark read, like, bookmark). Example:
+
+```dart
+final token = await auth.login(email, password);
+final headers = { 'Authorization': 'Bearer $token' };
+await api.post('/v1/push/register', body: {'token': deviceToken}, headers: headers);
+await api.post('/v1/stories/$id/read', headers: headers);
+```
+
+5. Server configuration
+   - Set FCM server key in environment (FCM_SERVER_KEY) to enable real push sending.
+   - JWT_SECRET_KEY must be set in production and kept secret.
+
+6. API docs
+   - FastAPI OpenAPI docs available at /docs when running the server.
+
