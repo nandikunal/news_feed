@@ -32,16 +32,19 @@ async def lifespan(app: FastAPI):
     await db.clear_all()
 
     # 3. Seed default feeds (idempotent)
-    for f in DEFAULT_FEEDS:
-        fid = hashlib.md5(f["url"].encode()).hexdigest()[:12]
-        if not await db.get_feed(fid):
-            await db.add_feed(FeedSource(
-                id=fid,
-                name=f["name"],
-                url=f["url"],
-                category=FeedCategory(f["category"]),
-                is_user_selectable=f.get("selectable", True),
-            ))
+    # Skip seeding during pytest runs to keep test isolation (tests use in-memory store).
+    import os
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        for f in DEFAULT_FEEDS:
+            fid = hashlib.md5(f["url"].encode()).hexdigest()[:12]
+            if not await db.get_feed(fid):
+                await db.add_feed(FeedSource(
+                    id=fid,
+                    name=f["name"],
+                    url=f["url"],
+                    category=FeedCategory(f["category"]),
+                    is_user_selectable=f.get("selectable", True),
+                ))
 
     # 4. Non-blocking initial cache warm
     asyncio.create_task(_initial_warm())

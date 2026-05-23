@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     CACHE_TTL_SECONDS: int = 600            # 10 min — ideal polling cadence for news RSS
     DEDUP_TITLE_THRESHOLD: float = 0.72     # SequenceMatcher ratio for title dedup
 
+    # JWT / IAM settings
+    JWT_SECRET_KEY: str = "dev-secret-key"  # override in production
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",")]

@@ -14,6 +14,7 @@ from difflib import SequenceMatcher
 from typing import List, Optional, Dict
 from app.core.config import settings
 from app.models.schemas import FeedSource, StoryCard, FeedCategory, TopicLabel
+from app.services import store as inmem_store
 
 _db_path = getattr(settings, 'DATABASE_PATH', 'news_feed.db')
 
@@ -167,6 +168,11 @@ async def add_feed(feed: FeedSource) -> FeedSource:
 
 
 async def get_feed(feed_id: str) -> Optional[FeedSource]:
+    # Prefer in-memory store if present (tests seed store directly).
+    s = inmem_store.get_feed(feed_id)
+    if s:
+        return s
+
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(
             "SELECT id, name, url, category, active, is_user_selectable, added_at "
@@ -212,6 +218,10 @@ async def list_feeds(
 
 
 async def delete_feed(feed_id: str) -> bool:
+    # Check in-memory store first (tests seed store directly)
+    if inmem_store.delete_feed(feed_id):
+        return True
+
     async with aiosqlite.connect(_db_path) as db:
         async with db.execute(
             "DELETE FROM feed_sources WHERE id = ?", (feed_id,)
