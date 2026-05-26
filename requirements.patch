@@ -1,0 +1,4 @@
+# Add to requirements.txt:
+#
+# sse-starlette>=1.6.1
+# backports.zoneinfo; python_version < '3.9'
