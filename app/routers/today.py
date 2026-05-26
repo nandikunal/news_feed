@@ -1,12 +1,11 @@
 """
 /v1/today  —  location-aware, 24-h capped story feed
 
-New in this version
--------------------
-* ?tz=  – IANA timezone string; stories filtered to user's local midnight
-* ?topic= – comma-separated topic slugs (server-side complement to client filter)
-* GET /v1/today/stats  – deduplicated read / unread / total counts
-* GET /v1/today/updates – SSE stream; fires when new story IDs arrive
+Endpoints
+---------
+GET  /v1/today            Stories for today in the user's timezone (paginated)
+GET  /v1/today/stats      Per-device read / unread / deduplicated-total counts
+GET  /v1/today/updates    Server-Sent Events — fires when new stories arrive
 """
 from __future__ import annotations
 
@@ -20,18 +19,12 @@ from typing import AsyncGenerator
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.config import settings
-from app.services.store import (
-    get_today_stories,
-    get_story_stats,
-)
+from app.core.config import settings
+from app.models.schemas import FeedCategory
+from app.services import database as db
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/today", tags=["today"])
-
-# TTL (seconds) for the in-memory cache
-CACHE_TTL = 300
-_cache: dict = {"ts": 0.0, "data": []}
 
 
 def _validate_api_key(x_api_key: str | None) -> None:
@@ -39,145 +32,162 @@ def _validate_api_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def _local_midnight_utc(tz_name: str) -> datetime:
-    """Return today's midnight in `tz_name` expressed as UTC-aware datetime."""
+def _compute_cutoff(tz_name: str) -> datetime:
+    """Return the strictest cutoff: user local midnight OR 24h ago, whichever is newer."""
     try:
         tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError:
         raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz_name}")
     now_local = datetime.now(tz)
     midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return midnight_local.astimezone(timezone.utc)
+    cutoff_tz = midnight_local.astimezone(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
+    return max(cutoff_tz, cutoff_24h)
 
 
-# ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # GET /v1/today
-# ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 @router.get("", summary="Today's stories (location-aware, 24h capped)")
 async def today(
     tz: str = Query("UTC", description="IANA timezone, e.g. Europe/Berlin"),
     topic: str | None = Query(
-        None,
-        description="Comma-separated topic slugs to filter, e.g. tech,sports",
+        None, description="Comma-separated topic slugs, e.g. tech,sports"
     ),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     x_api_key: str | None = Header(None),
+    x_device_id: str | None = Header(default="anonymous"),
 ):
     _validate_api_key(x_api_key)
+    cutoff = _compute_cutoff(tz)
 
-    cutoff_tz = _local_midnight_utc(tz)
-    now_utc = datetime.now(timezone.utc)
-    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
-    # Strictest cutoff: user local midnight OR 24h ago, whichever is more recent
-    cutoff = max(cutoff_tz, cutoff_24h)
-
-    stories = await get_today_stories(published_after=cutoff)
-
+    topics_filter = None
     if topic:
-        allowed = {t.strip().lower() for t in topic.split(",") if t.strip()}
-        stories = [s for s in stories if (s.get("topic") or "").lower() in allowed]
+        topics_filter = [t.strip().lower() for t in topic.split(",") if t.strip()]
 
-    # Deduplicate by story id (safety net against duplicate RSS entries)
-    seen: set = set()
-    deduped = []
-    for s in stories:
-        sid = s.get("id")
-        if sid not in seen:
-            seen.add(sid)
-            deduped.append(s)
+    stories = await db.get_stories(
+        category=FeedCategory.today,
+        page=page,
+        per_page=per_page,
+        since_published=cutoff,
+        topics=topics_filter,
+    )
 
-    total = len(deduped)
-    start = (page - 1) * per_page
-    page_data = deduped[start : start + per_page]
+    total = await db.count_stories(
+        category=FeedCategory.today,
+        since_published=cutoff,
+        topics=topics_filter,
+    )
+
+    # Annotate read flag per device
+    if x_device_id and x_device_id != "anonymous":
+        read_ids = set(await db.get_session_read_ids(x_device_id))
+        for s in stories:
+            s.read = s.id in read_ids
 
     return {
         "page": page,
         "per_page": per_page,
         "total": total,
-        "stories": page_data,
+        "stories": [s.model_dump() for s in stories],
     }
 
 
-# ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # GET /v1/today/stats
-# ───────────────────────────────────────────────────────────────────
-@router.get("/stats", summary="Read / unread / deduplicated-total counts for today")
+# ---------------------------------------------------------------------------
+@router.get("/stats", summary="Per-device read/unread/total counts for today")
 async def today_stats(
     tz: str = Query("UTC"),
     x_api_key: str | None = Header(None),
+    x_device_id: str | None = Header(default="anonymous"),
 ):
+    """
+    Returns read / unread / total counts scoped to the requesting device.
+    The Flutter app calls this on launch and after every mark-read action.
+    Displayed in the left drawer header and next to the bookmark icon.
+    """
     _validate_api_key(x_api_key)
-    cutoff_tz = _local_midnight_utc(tz)
-    now_utc = datetime.now(timezone.utc)
-    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
-    cutoff = max(cutoff_tz, cutoff_24h)
-    stats = await get_story_stats(published_after=cutoff)
+    cutoff = _compute_cutoff(tz)
+    session_id = x_device_id or "anonymous"
+    stats = await db.get_session_stats(session_id, since_published=cutoff)
+    stats["deduplicated_total"] = stats["total"]  # dedup is handled at cache_stories level
     return stats
 
 
-# ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # GET /v1/today/updates  —  Server-Sent Events
-# ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 async def _sse_generator(
-    tz: str, x_api_key: str | None
+    tz: str,
+    x_api_key: str | None,
+    request: Request,
 ) -> AsyncGenerator[str, None]:
-    """Yield SSE-formatted strings whenever new stories arrive."""
+    """Yield SSE-formatted strings whenever new stories are cached."""
     _validate_api_key(x_api_key)
 
-    POLL_INTERVAL = 30  # seconds
+    POLL_INTERVAL = 30  # seconds between DB polls
 
-    def _cutoff() -> datetime:
-        tz_ = ZoneInfo(tz)
-        now_local = datetime.now(tz_)
-        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff_tz = midnight_local.astimezone(timezone.utc)
-        now_utc = datetime.now(timezone.utc)
-        cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
-        return max(cutoff_tz, cutoff_24h)
+    # Snapshot the current latest cached_at timestamp as our watermark
+    stories_now = await db.get_stories(
+        category=FeedCategory.today,
+        page=1,
+        per_page=1,
+        since_published=_compute_cutoff(tz),
+    )
+    # Use the most recent cached_at as the SSE watermark
+    if stories_now:
+        watermark = stories_now[0].cached_at or datetime.now(timezone.utc)
+    else:
+        watermark = datetime.now(timezone.utc)
 
-    stories = await get_today_stories(published_after=_cutoff())
-    known_ids: set = {s.get("id") for s in stories}
+    total_at_connect = await db.count_stories(category=FeedCategory.today, since_published=_compute_cutoff(tz))
 
-    # Initial heartbeat so the client knows the connection is live
-    yield f"data: {json.dumps({'event': 'connected', 'total': len(known_ids)})}\n\n"
+    # Initial heartbeat — lets client know connection is live
+    yield f"data: {json.dumps({'event': 'connected', 'total': total_at_connect})}\n\n"
 
     while True:
+        if await request.is_disconnected():
+            break
         await asyncio.sleep(POLL_INTERVAL)
         try:
-            fresh = await get_today_stories(published_after=_cutoff())
-        except Exception as exc:  # pragma: no cover
+            new_stories = await db.get_stories_since(watermark, category=FeedCategory.today)
+        except Exception as exc:
             log.warning("SSE poll error: %s", exc)
             continue
 
-        fresh_ids = {s.get("id") for s in fresh}
-        new_ids = fresh_ids - known_ids
-        if new_ids:
-            new_stories = [s for s in fresh if s.get("id") in new_ids]
+        if new_stories:
+            # Advance watermark so we don't re-emit the same stories
+            watermark = max(s.cached_at for s in new_stories if s.cached_at) or watermark
             payload = {
                 "event": "new_stories",
                 "new_count": len(new_stories),
-                "stories": new_stories,
+                "stories": [s.model_dump(mode="json") for s in new_stories],
             }
-            yield f"data: {json.dumps(payload)}\n\n"
-            known_ids = fresh_ids
+            yield f"data: {json.dumps(payload, default=str)}\n\n"
 
 
-@router.get("/updates", summary="SSE stream — fires when new stories arrive")
+@router.get("/updates", summary="SSE stream — fires when new stories are published")
 async def today_updates(
     request: Request,
     tz: str = Query("UTC"),
     x_api_key: str | None = Header(None),
 ):
+    """
+    Server-Sent Events endpoint. The Flutter app subscribes when foregrounded
+    and disconnects on AppLifecycleState.paused.
+    New stories emit: {"event": "new_stories", "new_count": N, "stories": [...]}
+    Heartbeat on connect: {"event": "connected", "total": N}
+    """
     try:
         ZoneInfo(tz)
     except ZoneInfoNotFoundError:
         raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz}")
 
     async def event_stream() -> AsyncGenerator[str, None]:
-        async for chunk in _sse_generator(tz, x_api_key):
-            if await request.is_disconnected():
-                break
+        async for chunk in _sse_generator(tz, x_api_key, request):
             yield chunk
 
     return StreamingResponse(
@@ -186,5 +196,6 @@ async def today_updates(
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
         },
     )

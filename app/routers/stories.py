@@ -1,72 +1,60 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
+from app.config import settings
+from app.services import store
 
-from app.core.security import require_read_access
-from app.models.schemas import StoryCard, ActionResponse
-from app.services import database as db
-
-router = APIRouter(prefix="/v1/stories", tags=["Story Actions"])
+router = APIRouter(prefix="/v1/stories", tags=["stories"])
 
 
-def _get_device_id(x_device_id: str = Header(default="anonymous")) -> str:
-    return x_device_id or "anonymous"
+def _validate_api_key(x_api_key: str | None) -> None:
+    if x_api_key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-@router.get("/{story_id}", response_model=StoryCard)
-async def get_story(
-    story_id: str,
-    _=Depends(require_read_access),
-):
-    story = await db.get_story(story_id)
-    if not story:
-        raise HTTPException(status_code=404, detail="Story not found")
-    return story
-
-
-@router.post("/{story_id}/read", response_model=ActionResponse)
+@router.post("/{story_id}/read", summary="Mark a story as read")
 async def mark_read(
     story_id: str,
-    device_id: str = Depends(_get_device_id),
-    _=Depends(require_read_access),
+    x_api_key: str | None = Header(None),
+    x_device_id: str | None = Header(None),
 ):
-    """
-    Marks a story as read for this specific device.
-    Scoped via X-Device-ID header so each device has its own read history.
-    After this call, GET /v1/today will no longer return this story for the device.
-    Also updates the global read flag for backward compatibility.
-
-    Fix: was calling db.mark_story_read_for_device which does not exist.
-    Correct function is db.mark_story_read_in_session (idempotent, returns None).
-    Guard against 404 by checking story existence separately.
-    """
-    story = await db.get_story(story_id)
-    if not story:
+    _validate_api_key(x_api_key)
+    # Pass device_id so per-device stats work correctly
+    ok = store.mark_read(story_id, device_id=x_device_id)
+    if not ok:
         raise HTTPException(status_code=404, detail="Story not found")
-    # mark_story_read_in_session is idempotent and returns None
-    await db.mark_story_read_in_session(device_id, story_id)
-    return ActionResponse(success=True, message="Marked as read")
+    return {"ok": True, "story_id": story_id}
 
 
-@router.post("/{story_id}/like", response_model=ActionResponse)
+@router.post("/{story_id}/like", summary="Toggle like on a story")
 async def like_story(
     story_id: str,
-    _=Depends(require_read_access),
+    x_api_key: str | None = Header(None),
 ):
-    new_state = await db.toggle_story_field(story_id, "liked")
-    if new_state is None:
+    _validate_api_key(x_api_key)
+    liked = store.toggle_like(story_id)
+    if liked is None:
         raise HTTPException(status_code=404, detail="Story not found")
-    return ActionResponse(
-        success=True, message="Liked" if new_state else "Unliked"
-    )
+    return {"ok": True, "liked": liked}
 
 
-@router.post("/{story_id}/bookmark", response_model=ActionResponse)
+@router.post("/{story_id}/bookmark", summary="Toggle bookmark on a story")
 async def bookmark_story(
     story_id: str,
-    _=Depends(require_read_access),
+    x_api_key: str | None = Header(None),
 ):
-    new_state = await db.toggle_story_field(story_id, "bookmarked")
-    if new_state is None:
+    _validate_api_key(x_api_key)
+    bookmarked = store.toggle_bookmark(story_id)
+    if bookmarked is None:
         raise HTTPException(status_code=404, detail="Story not found")
-    return ActionResponse(
-        success=True, message="Bookmarked" if new_state else "Unbookmarked"
-    )
+    return {"ok": True, "bookmarked": bookmarked}
+
+
+@router.get("/bookmarked", summary="List bookmarked stories")
+async def list_bookmarked(
+    x_api_key: str | None = Header(None),
+):
+    _validate_api_key(x_api_key)
+    stories = [
+        s for s in store._stories.values() if s.bookmarked
+    ]
+    stories.sort(key=lambda s: s.published_at or __import__('datetime').datetime.min, reverse=True)
+    return {"stories": [s.model_dump() for s in stories]}
