@@ -1,245 +1,184 @@
+"""
+/v1/today  —  location-aware, 24-h capped story feed
+
+New in this version
+-------------------
+* ?tz=  – IANA timezone string; stories filtered to user's local midnight
+* ?topic= – comma-separated topic slugs (server-side complement to client filter)
+* GET /v1/today/stats  – deduplicated read / unread / total counts
+* GET /v1/today/updates – SSE stream; fires when new story IDs arrive
+"""
+from __future__ import annotations
+
 import asyncio
 import json
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+import logging
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import AsyncGenerator
 
-from fastapi import APIRouter, Depends, Query, Request, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from app.core.security import require_read_access
-from app.models.schemas import (
-    TodayFeedResponse, SearchResponse, FeedStatsResponse, FeedCategory,
-)
-from app.services import database as db
 
-router = APIRouter(prefix="/v1/today", tags=["Today Tab"])
+from app.config import settings
+from app.services.store import (
+    get_today_stories,
+    get_story_stats,
+)
+
+log = logging.getLogger(__name__)
+router = APIRouter(prefix="/v1/today", tags=["today"])
+
+# TTL (seconds) for the in-memory cache
+CACHE_TTL = 300
+_cache: dict = {"ts": 0.0, "data": []}
+
+
+def _validate_api_key(x_api_key: str | None) -> None:
+    if x_api_key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def _local_midnight_utc(tz_name: str) -> datetime:
-    """Return today's midnight in the given IANA timezone as a UTC-aware datetime."""
+    """Return today's midnight in `tz_name` expressed as UTC-aware datetime."""
     try:
         tz = ZoneInfo(tz_name)
-    except (ZoneInfoNotFoundError, KeyError):
-        raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz_name!r}")
-    local_now = datetime.now(tz)
-    midnight_local = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    except ZoneInfoNotFoundError:
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz_name}")
+    now_local = datetime.now(tz)
+    midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight_local.astimezone(timezone.utc)
 
 
-def _session_id(request: Request) -> str:
-    return request.headers.get("X-Session-ID", "default")
-
-
-def _since_cutoff(tz: str) -> datetime:
-    """Compute the stricter of local midnight and 24 h ago."""
-    midnight = _local_midnight_utc(tz)
-    cap = datetime.now(timezone.utc) - timedelta(hours=24)
-    return max(midnight, cap)
-
-
-@router.get(
-    "",
-    response_model=TodayFeedResponse,
-    summary="Get today's stories — timezone-aware, topic-filtered, session-aware",
-)
-async def get_today_stories(
-    request: Request,
-    page: int = Query(default=1, ge=1),
-    per_page: int = Query(default=5, ge=1, le=20),
-    tz: str = Query(default="UTC", description="IANA timezone, e.g. Europe/Berlin"),
-    topics: Optional[str] = Query(
-        default=None,
-        description="Comma-separated topic filter, e.g. tech,sports,health",
+# ───────────────────────────────────────────────────────────────────
+# GET /v1/today
+# ───────────────────────────────────────────────────────────────────
+@router.get("", summary="Today's stories (location-aware, 24h capped)")
+async def today(
+    tz: str = Query("UTC", description="IANA timezone, e.g. Europe/Berlin"),
+    topic: str | None = Query(
+        None,
+        description="Comma-separated topic slugs to filter, e.g. tech,sports",
     ),
-    hide_read: bool = Query(
-        default=True,
-        description="Exclude stories already read in this session",
-    ),
-    _=Depends(require_read_access),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    x_api_key: str | None = Header(None),
 ):
-    """
-    Flutter usage:
-      GET /v1/today?page=1&per_page=20&tz=Europe/Berlin&hide_read=true
-      GET /v1/today?topics=tech,sports&tz=Europe/Berlin
-    """
-    session_id = _session_id(request)
-    since = _since_cutoff(tz)
+    _validate_api_key(x_api_key)
 
-    topic_list: Optional[List[str]] = None
-    if topics:
-        topic_list = [t.strip().lower() for t in topics.split(",") if t.strip()]
+    cutoff_tz = _local_midnight_utc(tz)
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
+    # Strictest cutoff: user local midnight OR 24h ago, whichever is more recent
+    cutoff = max(cutoff_tz, cutoff_24h)
 
-    exclude_ids: Optional[List[str]] = None
-    if hide_read:
-        exclude_ids = await db.get_session_read_ids(session_id)
+    stories = await get_today_stories(published_after=cutoff)
 
-    meta = await db.get_cache_meta()
-    stories = await db.get_stories(
-        category=FeedCategory.today,
-        page=page,
-        per_page=per_page,
-        since_published=since,
-        topics=topic_list,
-        exclude_ids=exclude_ids,
-    )
-    total = await db.count_stories(
-        category=FeedCategory.today,
-        since_published=since,
-    )
-    return TodayFeedResponse(
-        stories=stories,
-        total=total,
-        page=page,
-        per_page=per_page,
-        last_refresh_at=meta.get("last_refresh_at"),
-        cached_at=datetime.now(timezone.utc),
-        from_cache=True,
-    )
+    if topic:
+        allowed = {t.strip().lower() for t in topic.split(",") if t.strip()}
+        stories = [s for s in stories if (s.get("topic") or "").lower() in allowed]
 
+    # Deduplicate by story id (safety net against duplicate RSS entries)
+    seen: set = set()
+    deduped = []
+    for s in stories:
+        sid = s.get("id")
+        if sid not in seen:
+            seen.add(sid)
+            deduped.append(s)
 
-@router.get(
-    "/stats",
-    response_model=FeedStatsResponse,
-    summary="Get deduplicated read/unread/total counts for today",
-)
-async def get_feed_stats(
-    request: Request,
-    tz: str = Query(default="UTC"),
-    _=Depends(require_read_access),
-):
-    """
-    Called in parallel with stories fetch on app launch.
-    Re-called after every POST /v1/stories/{id}/read.
-    Sends X-Session-ID header to track per-device read state.
-    """
-    session_id = _session_id(request)
-    since = _since_cutoff(tz)
-    stats = await db.get_session_stats(session_id, since_published=since)
-    return FeedStatsResponse(
-        read=stats["read"],
-        unread=stats["unread"],
-        total=stats["total"],
-        deduplicated_total=stats["total"],
-    )
+    total = len(deduped)
+    start = (page - 1) * per_page
+    page_data = deduped[start : start + per_page]
 
-
-@router.put(
-    "/session",
-    summary="Persist session state — last viewed story index and optional read marker",
-)
-async def update_session(
-    request: Request,
-    tz: str = Query(default="UTC"),
-    _=Depends(require_read_access),
-):
-    """
-    Called by the Flutter app to:
-      - Record which story index the user last viewed (for resume-on-reopen).
-      - Optionally mark a story as read in the same call.
-
-    Request body (JSON, all fields optional):
-      {
-        "last_story_index": 6,
-        "story_id": "abc123"   // if present, also marks this story as read
-      }
-
-    Returns current session stats so the app can update its counters
-    in a single round-trip.
-
-    Note: last_story_index is informational — the backend acknowledges it
-    but story ordering is owned by the client. The value is echoed back
-    so the app can confirm receipt.
-    """
-    session_id = _session_id(request)
-    since = _since_cutoff(tz)
-
-    body: dict = {}
-    try:
-        body = await request.json()
-    except Exception:
-        pass  # empty body is fine — stats-only update
-
-    story_id: Optional[str] = body.get("story_id")
-    last_story_index: Optional[int] = body.get("last_story_index")
-
-    if story_id:
-        story = await db.get_story(story_id)
-        if story:
-            await db.mark_story_read_in_session(session_id, story_id)
-
-    stats = await db.get_session_stats(session_id, since_published=since)
     return {
-        "session_id": session_id,
-        "last_story_index": last_story_index,
-        "read": stats["read"],
-        "unread": stats["unread"],
-        "total": stats["total"],
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "stories": page_data,
     }
 
 
-@router.get(
-    "/updates",
-    summary="SSE stream — push new story events as they arrive in the cache",
-)
-async def get_updates_sse(
-    request: Request,
-    since: datetime = Query(
-        ...,
-        description="ISO 8601 timestamp — Flutter sends its last known cached_at value",
-    ),
-    _=Depends(require_read_access),
+# ───────────────────────────────────────────────────────────────────
+# GET /v1/today/stats
+# ───────────────────────────────────────────────────────────────────
+@router.get("/stats", summary="Read / unread / deduplicated-total counts for today")
+async def today_stats(
+    tz: str = Query("UTC"),
+    x_api_key: str | None = Header(None),
 ):
-    """
-    Server-Sent Events endpoint.
+    _validate_api_key(x_api_key)
+    cutoff_tz = _local_midnight_utc(tz)
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
+    cutoff = max(cutoff_tz, cutoff_24h)
+    stats = await get_story_stats(published_after=cutoff)
+    return stats
 
-    Flutter app:
-      - Connects on foreground resume
-      - Disconnects on background pause
-      - Sends: GET /v1/today/updates?since=<last_cached_at_iso>
 
-    Each event:  data: {"total_new": N, "stories": [{id, title, ...}]}
-    Keepalive:   : ping  (every 25 s to survive proxy timeouts)
-    """
-    last_since = since
+# ───────────────────────────────────────────────────────────────────
+# GET /v1/today/updates  —  Server-Sent Events
+# ───────────────────────────────────────────────────────────────────
+async def _sse_generator(
+    tz: str, x_api_key: str | None
+) -> AsyncGenerator[str, None]:
+    """Yield SSE-formatted strings whenever new stories arrive."""
+    _validate_api_key(x_api_key)
 
-    async def event_stream():
-        nonlocal last_since
+    POLL_INTERVAL = 30  # seconds
+
+    def _cutoff() -> datetime:
+        tz_ = ZoneInfo(tz)
+        now_local = datetime.now(tz_)
+        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        cutoff_tz = midnight_local.astimezone(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
+        cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
+        return max(cutoff_tz, cutoff_24h)
+
+    stories = await get_today_stories(published_after=_cutoff())
+    known_ids: set = {s.get("id") for s in stories}
+
+    # Initial heartbeat so the client knows the connection is live
+    yield f"data: {json.dumps({'event': 'connected', 'total': len(known_ids)})}\n\n"
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
         try:
-            while True:
-                if await request.is_disconnected():
-                    break
+            fresh = await get_today_stories(published_after=_cutoff())
+        except Exception as exc:  # pragma: no cover
+            log.warning("SSE poll error: %s", exc)
+            continue
 
-                new_stories = await db.get_stories_since(
-                    last_since, category=FeedCategory.today
-                )
-                if new_stories:
-                    payload = json.dumps({
-                        "total_new": len(new_stories),
-                        "stories": [
-                            {
-                                "id": s.id,
-                                "title": s.title,
-                                "short_content": s.short_content,
-                                "image_url": s.image_url,
-                                "source": s.source,
-                                "topic": s.topic.value,
-                                "category": s.category.value,
-                                "published_at": s.published_at.isoformat()
-                                if s.published_at else None,
-                            }
-                            for s in new_stories
-                        ],
-                        "checked_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    yield f"data: {payload}\n\n"
-                    last_since = datetime.now(timezone.utc)
-                else:
-                    yield ": ping\n\n"
+        fresh_ids = {s.get("id") for s in fresh}
+        new_ids = fresh_ids - known_ids
+        if new_ids:
+            new_stories = [s for s in fresh if s.get("id") in new_ids]
+            payload = {
+                "event": "new_stories",
+                "new_count": len(new_stories),
+                "stories": new_stories,
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            known_ids = fresh_ids
 
-                await asyncio.sleep(25)
-        except asyncio.CancelledError:
-            pass
+
+@router.get("/updates", summary="SSE stream — fires when new stories arrive")
+async def today_updates(
+    request: Request,
+    tz: str = Query("UTC"),
+    x_api_key: str | None = Header(None),
+):
+    try:
+        ZoneInfo(tz)
+    except ZoneInfoNotFoundError:
+        raise HTTPException(status_code=400, detail=f"Unknown timezone: {tz}")
+
+    async def event_stream() -> AsyncGenerator[str, None]:
+        async for chunk in _sse_generator(tz, x_api_key):
+            if await request.is_disconnected():
+                break
+            yield chunk
 
     return StreamingResponse(
         event_stream(),
@@ -249,16 +188,3 @@ async def get_updates_sse(
             "X-Accel-Buffering": "no",
         },
     )
-
-
-@router.get(
-    "/search",
-    response_model=SearchResponse,
-    summary="Search cached stories",
-)
-async def search_stories(
-    q: str = Query(min_length=1, max_length=100),
-    _=Depends(require_read_access),
-):
-    results = await db.search_stories(q, category=FeedCategory.today)
-    return SearchResponse(stories=results, query=q, total=len(results))
