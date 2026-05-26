@@ -16,8 +16,6 @@ DEFAULT_FEEDS = [
     # CC BY 3.0 — AI summary safe
     {"url": "https://globalvoices.org/feed/", "name": "Global Voices", "category": "today", "selectable": True},
     {"url": "https://feeds.feedburner.com/TechCrunch/", "name": "TechCrunch", "category": "today", "selectable": True},
-    {"url": "https://www.scientificamerican.com/feed/rss/", "name": "Scientific American", "category": "today", "selectable": True},
-    {"url": "https://www.nature.com/nature/articles?type=article.rss", "name": "Nature", "category": "today", "selectable": True},
     {"url": "https://www.sciencealert.com/rss", "name": "Science Alert", "category": "today", "selectable": True},
     {"url": "https://www.sciencemag.org/rss/news_current.xml", "name": "Science Magazine", "category": "today", "selectable": True},
     {"url": "https://www.npr.org/rss/rss.php?id=1001", "name": "NPR News", "category": "today", "selectable": True},
@@ -30,7 +28,6 @@ DEFAULT_FEEDS = [
     {"url": "https://www.theguardian.com/world/rss", "name": "The Guardian World", "category": "today", "selectable": False},
     {"url": "https://www.wired.com/feed/rss", "name": "Wired", "category": "today", "selectable": False},
     {"url": "https://www.cnet.com/rss/news/", "name": "CNET News", "category": "today", "selectable": False},
-    {"url": "https://www.scientificamerican.com/rss/health/", "name": "Scientific American Health", "category": "today", "selectable": False},
     {"url": "https://www.sciencemag.org/rss/health_current.xml", "name": "Science Magazine Health", "category": "today", "selectable": False},
     {"url": "https://rss.nytimes.com/services/xml/rss/nyt/Health.xml", "name": "NYT Health", "category": "today", "selectable": False},
 ]
