@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Set
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator
 
@@ -48,21 +48,22 @@ class StoryCard(BaseModel):
     bookmarked: bool = False
     category: FeedCategory = FeedCategory.today
 
-    # ── Task 1: Story Clustering ────────────────────────────────────────
-    # IDs of other stories covering the same event from different sources.
-    # Empty list = singleton story (no related coverage found).
+    # Per-device read tracking: set of device IDs that have read this story.
+    # Not serialised to API responses (excluded=True in future if needed).
+    # Used exclusively by /v1/today/stats to compute per-device counts.
+    read_by: Set[str] = Field(default_factory=set, exclude=True)
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    # -- Task 1: Story Clustering ------------------------------------------
     related_story_ids: List[str] = Field(default_factory=list)
-    # Shared cluster key; None for unclustered stories.
     cluster_id: Optional[str] = None
 
-    # ── Task 2: Source Quality Score ──────────────────────────────────
-    # Normalised quality score [0.0, 1.0] computed from fetch success rate,
-    # image presence rate, summary length, and publish frequency.
-    # None = score not yet computed for this source.
+    # -- Task 2: Source Quality Score -------------------------------------
     source_quality_score: Optional[float] = None
 
 
-# ── Feed management models (used by feeds.py router) ────────────────────────
+# -- Feed management models --------------------------------------------------
 
 class FeedSource(BaseModel):
     id: str
@@ -73,7 +74,6 @@ class FeedSource(BaseModel):
     is_user_selectable: bool = True
     added_at: datetime = Field(default_factory=datetime.utcnow)
 
-    # ── Task 2: quality metrics exposed on admin endpoints ───────────────
     quality_score: Optional[float] = None
     fetch_success_rate: Optional[float] = None
     avg_image_rate: Optional[float] = None
@@ -82,7 +82,6 @@ class FeedSource(BaseModel):
 
 
 class AddFeedRequest(BaseModel):
-    """Request body for POST /v1/feeds — register a new RSS feed."""
     url: str
     name: Optional[str] = None
     category: FeedCategory = FeedCategory.today
@@ -98,7 +97,6 @@ class AddFeedRequest(BaseModel):
 
 
 class PreviewFeedRequest(BaseModel):
-    """Request body for POST /v1/feeds/preview — dry-run without saving."""
     url: str
     limit: int = 5
 
@@ -110,7 +108,6 @@ class PreviewFeedRequest(BaseModel):
         return v
 
 
-# Legacy alias — kept so any existing code using FeedCreate still works
 class FeedCreate(AddFeedRequest):
     pass
 
@@ -143,19 +140,13 @@ class ActionResponse(BaseModel):
     message: str = ""
 
 
-# ── Stats models ───────────────────────────────────────────────────────
-
 class FeedStatsResponse(BaseModel):
-    """Read/unread/total counts for today's stories (session-scoped).
-    Used by GET /v1/today/stats — shown in the app's left drawer.
-    """
     read: int
     unread: int
     total: int
     deduplicated_total: int
 
 
-# Alias with timestamp — Flutter models may use this name
 class StatsResponse(FeedStatsResponse):
     as_of: datetime = Field(default_factory=datetime.utcnow)
 
@@ -181,7 +172,6 @@ class TodayFeedResponse(BaseModel):
     last_refresh_at: Optional[datetime] = None
     from_cache: bool = True
     new_stories_available: bool = False
-    # Task 3: expose the mode used to build this deck
     mode: Optional[str] = None
 
 
@@ -203,10 +193,7 @@ class RefreshJob(BaseModel):
     attempts: int = 0
 
 
-# ── Session models ──────────────────────────────────────────────────
-
 class UserSession(BaseModel):
-    """Per-device session state."""
     device_id: str
     read_story_ids: List[str] = []
     last_story_index: int = 0
@@ -223,9 +210,7 @@ class SessionUpdateRequest(BaseModel):
     location_label: str = ""
 
 
-# ── Task 4: Intent-Based Deck Mode ────────────────────────────────────
-
 class DeckMode(str, Enum):
-    quick = "quick"       # 8-10 stories — glanceable session
-    standard = "standard" # 20 stories    — default
-    deep = "deep"         # 40+ stories   — long read / commute mode
+    quick = "quick"
+    standard = "standard"
+    deep = "deep"
