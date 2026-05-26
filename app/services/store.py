@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from app.models.schemas import FeedSource, StoryCard, FeedCategory
 
@@ -39,9 +39,11 @@ def cache_stories(stories: List[StoryCard]):
     global _cache_updated_at
     for s in stories:
         if s.id in _stories:
+            # Preserve interaction state across refreshes
             s.read = _stories[s.id].read
             s.liked = _stories[s.id].liked
             s.bookmarked = _stories[s.id].bookmarked
+            s.read_by = _stories[s.id].read_by
         _stories[s.id] = s
     _cache_updated_at = datetime.utcnow()
 
@@ -86,11 +88,111 @@ def search_stories(query: str, category: Optional[FeedCategory] = None) -> List[
     return results
 
 
+# ── Today-scoped helpers (used by /v1/today router) ───────────────────────────
+
+async def get_today_stories(published_after: datetime) -> List[dict]:
+    """Return deduplicated stories published after `published_after` as dicts.
+
+    The cutoff is already computed by the today router (local midnight vs 24h,
+    whichever is stricter). Stories are sorted newest-first.
+    """
+    # Normalise cutoff to UTC-aware
+    if published_after.tzinfo is None:
+        published_after = published_after.replace(tzinfo=timezone.utc)
+
+    seen: set = set()
+    result: List[dict] = []
+    stories = sorted(
+        _stories.values(),
+        key=lambda s: s.published_at or datetime.min,
+        reverse=True,
+    )
+    for s in stories:
+        pub = s.published_at
+        if pub is None:
+            continue
+        # Make pub UTC-aware for comparison
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        if pub < published_after:
+            continue
+        if s.id in seen:
+            continue
+        seen.add(s.id)
+        result.append({
+            "id": s.id,
+            "title": s.title,
+            "short_content": s.short_content,
+            "image_url": s.image_url,
+            "source": s.source,
+            "link": s.link,
+            "published_at": s.published_at.isoformat() if s.published_at else None,
+            "category": s.category.value if s.category else "today",
+            "topic": s.topic.value if s.topic else "general",
+            "read": s.read,
+            "liked": s.liked,
+            "bookmarked": s.bookmarked,
+        })
+    return result
+
+
+async def get_story_stats(
+    published_after: datetime,
+    device_id: Optional[str] = None,
+) -> dict:
+    """Return read/unread/total counts for today's deduplicated stories.
+
+    If `device_id` is supplied, `read` count reflects stories read by
+    that specific device (via the `read_by` set).  Falls back to the
+    global `story.read` flag when no device_id is given.
+    """
+    if published_after.tzinfo is None:
+        published_after = published_after.replace(tzinfo=timezone.utc)
+
+    seen: set = set()
+    total = 0
+    read_count = 0
+
+    stories = sorted(
+        _stories.values(),
+        key=lambda s: s.published_at or datetime.min,
+        reverse=True,
+    )
+    for s in stories:
+        pub = s.published_at
+        if pub is None:
+            continue
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        if pub < published_after:
+            continue
+        if s.id in seen:
+            continue
+        seen.add(s.id)
+        total += 1
+        if device_id:
+            if device_id in getattr(s, "read_by", set()):
+                read_count += 1
+        else:
+            if s.read:
+                read_count += 1
+
+    return {
+        "read": read_count,
+        "unread": total - read_count,
+        "total": total,
+        "deduplicated_total": total,
+    }
+
+
 # ── Story state mutations ─────────────────────────────────────────────────────
 
-def mark_read(story_id: str) -> bool:
+def mark_read(story_id: str, device_id: Optional[str] = None) -> bool:
+    """Mark a story as read.  Optionally record the reading device."""
     if story_id in _stories:
         _stories[story_id].read = True
+        if device_id:
+            _stories[story_id].read_by.add(device_id)
         return True
     return False
 

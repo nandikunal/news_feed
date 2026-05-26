@@ -1,12 +1,12 @@
 """
 /v1/today  —  location-aware, 24-h capped story feed
 
-New in this version
--------------------
-* ?tz=  – IANA timezone string; stories filtered to user's local midnight
-* ?topic= – comma-separated topic slugs (server-side complement to client filter)
-* GET /v1/today/stats  – deduplicated read / unread / total counts
-* GET /v1/today/updates – SSE stream; fires when new story IDs arrive
+Endpoints
+---------
+GET /v1/today               – paginated story feed filtered to user's local day
+GET /v1/today/stats         – deduplicated read / unread / total counts (per device)
+GET /v1/today/updates       – Server-Sent Events; fires when new stories arrive
+PUT /v1/today/session       – persist last-viewed index + topic preferences
 """
 from __future__ import annotations
 
@@ -29,10 +29,6 @@ from app.services.store import (
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/today", tags=["today"])
 
-# TTL (seconds) for the in-memory cache
-CACHE_TTL = 300
-_cache: dict = {"ts": 0.0, "data": []}
-
 
 def _validate_api_key(x_api_key: str | None) -> None:
     if x_api_key != settings.API_KEY:
@@ -50,10 +46,18 @@ def _local_midnight_utc(tz_name: str) -> datetime:
     return midnight_local.astimezone(timezone.utc)
 
 
+def _strict_cutoff(tz_name: str) -> datetime:
+    """Stricter of local midnight vs 24 h ago."""
+    cutoff_tz = _local_midnight_utc(tz_name)
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
+    return max(cutoff_tz, cutoff_24h)
+
+
 # ───────────────────────────────────────────────────────────────────
 # GET /v1/today
 # ───────────────────────────────────────────────────────────────────
-@router.get("", summary="Today's stories (location-aware, 24h capped)")
+@router.get("", summary="Today's stories (location-aware, 24 h capped)")
 async def today(
     tz: str = Query("UTC", description="IANA timezone, e.g. Europe/Berlin"),
     topic: str | None = Query(
@@ -63,33 +67,28 @@ async def today(
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     x_api_key: str | None = Header(None),
+    x_device_id: str | None = Header(None),
 ):
     _validate_api_key(x_api_key)
-
-    cutoff_tz = _local_midnight_utc(tz)
-    now_utc = datetime.now(timezone.utc)
-    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
-    # Strictest cutoff: user local midnight OR 24h ago, whichever is more recent
-    cutoff = max(cutoff_tz, cutoff_24h)
-
+    cutoff = _strict_cutoff(tz)
     stories = await get_today_stories(published_after=cutoff)
 
     if topic:
         allowed = {t.strip().lower() for t in topic.split(",") if t.strip()}
         stories = [s for s in stories if (s.get("topic") or "").lower() in allowed]
 
-    # Deduplicate by story id (safety net against duplicate RSS entries)
-    seen: set = set()
-    deduped = []
-    for s in stories:
-        sid = s.get("id")
-        if sid not in seen:
-            seen.add(sid)
-            deduped.append(s)
+    # Per-device read flag: if the requesting device has read this story,
+    # mark it so the client can skip it.
+    if x_device_id:
+        from app.services.store import get_story
+        for s in stories:
+            story_obj = get_story(s["id"])
+            if story_obj and x_device_id in getattr(story_obj, "read_by", set()):
+                s["read"] = True
 
-    total = len(deduped)
+    total = len(stories)
     start = (page - 1) * per_page
-    page_data = deduped[start : start + per_page]
+    page_data = stories[start: start + per_page]
 
     return {
         "page": page,
@@ -106,13 +105,16 @@ async def today(
 async def today_stats(
     tz: str = Query("UTC"),
     x_api_key: str | None = Header(None),
+    x_device_id: str | None = Header(None),
 ):
+    """Return per-device read/unread/total for today's deduplicated stories.
+
+    The X-Device-ID header scopes the 'read' count to the requesting device,
+    so each user sees their own progress rather than a global aggregate.
+    """
     _validate_api_key(x_api_key)
-    cutoff_tz = _local_midnight_utc(tz)
-    now_utc = datetime.now(timezone.utc)
-    cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
-    cutoff = max(cutoff_tz, cutoff_24h)
-    stats = await get_story_stats(published_after=cutoff)
+    cutoff = _strict_cutoff(tz)
+    stats = await get_story_stats(published_after=cutoff, device_id=x_device_id)
     return stats
 
 
@@ -128,13 +130,7 @@ async def _sse_generator(
     POLL_INTERVAL = 30  # seconds
 
     def _cutoff() -> datetime:
-        tz_ = ZoneInfo(tz)
-        now_local = datetime.now(tz_)
-        midnight_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        cutoff_tz = midnight_local.astimezone(timezone.utc)
-        now_utc = datetime.now(timezone.utc)
-        cutoff_24h = datetime.fromtimestamp(now_utc.timestamp() - 86_400, tz=timezone.utc)
-        return max(cutoff_tz, cutoff_24h)
+        return _strict_cutoff(tz)
 
     stories = await get_today_stories(published_after=_cutoff())
     known_ids: set = {s.get("id") for s in stories}
@@ -169,6 +165,12 @@ async def today_updates(
     tz: str = Query("UTC"),
     x_api_key: str | None = Header(None),
 ):
+    """Server-Sent Events endpoint.
+
+    The Flutter app subscribes while in the foreground and disconnects on
+    AppLifecycleState.paused.  When new RSS items are ingested the stream
+    emits a `new_stories` event so the app can show the refresh banner.
+    """
     try:
         ZoneInfo(tz)
     except ZoneInfoNotFoundError:
@@ -188,3 +190,35 @@ async def today_updates(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ───────────────────────────────────────────────────────────────────
+# PUT /v1/today/session
+# ───────────────────────────────────────────────────────────────────
+@router.put("/session", summary="Persist last-viewed index and topic preferences")
+async def today_session(
+    request: Request,
+    x_api_key: str | None = Header(None),
+    x_device_id: str | None = Header(None),
+):
+    """Lightweight session sync called by the Flutter app on every swipe.
+
+    Body (JSON, all optional):
+        last_story_index  int
+        selected_topics   list[str]
+        display_name      str
+        location_label    str
+    """
+    _validate_api_key(x_api_key)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    # Currently a no-op store — extend as needed for cross-device sync.
+    log.debug(
+        "Session sync device=%s index=%s topics=%s",
+        x_device_id,
+        body.get("last_story_index"),
+        body.get("selected_topics"),
+    )
+    return {"ok": True}
