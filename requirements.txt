@@ -13,3 +13,5 @@ python-multipart>=0.0.9
 sse-starlette>=1.8.2
 # zoneinfo is stdlib in Python 3.9+; backport only needed on 3.8
 # backports.zoneinfo; python_version < '3.9'
+passlib[bcrypt]==1.7.4
+bcrypt==4.1.3
