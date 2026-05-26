@@ -48,8 +48,21 @@ class StoryCard(BaseModel):
     bookmarked: bool = False
     category: FeedCategory = FeedCategory.today
 
+    # ── Task 1: Story Clustering ────────────────────────────────────────
+    # IDs of other stories covering the same event from different sources.
+    # Empty list = singleton story (no related coverage found).
+    related_story_ids: List[str] = Field(default_factory=list)
+    # Shared cluster key; None for unclustered stories.
+    cluster_id: Optional[str] = None
 
-# ── Feed management models (used by feeds.py router) ──────────────────────────
+    # ── Task 2: Source Quality Score ──────────────────────────────────
+    # Normalised quality score [0.0, 1.0] computed from fetch success rate,
+    # image presence rate, summary length, and publish frequency.
+    # None = score not yet computed for this source.
+    source_quality_score: Optional[float] = None
+
+
+# ── Feed management models (used by feeds.py router) ────────────────────────
 
 class FeedSource(BaseModel):
     id: str
@@ -59,6 +72,13 @@ class FeedSource(BaseModel):
     active: bool = True
     is_user_selectable: bool = True
     added_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # ── Task 2: quality metrics exposed on admin endpoints ───────────────
+    quality_score: Optional[float] = None
+    fetch_success_rate: Optional[float] = None
+    avg_image_rate: Optional[float] = None
+    avg_summary_length: Optional[float] = None
+    avg_publish_frequency_per_day: Optional[float] = None
 
 
 class AddFeedRequest(BaseModel):
@@ -123,7 +143,7 @@ class ActionResponse(BaseModel):
     message: str = ""
 
 
-# ── Stats models ──────────────────────────────────────────────────────────────
+# ── Stats models ───────────────────────────────────────────────────────
 
 class FeedStatsResponse(BaseModel):
     """Read/unread/total counts for today's stories (session-scoped).
@@ -161,6 +181,8 @@ class TodayFeedResponse(BaseModel):
     last_refresh_at: Optional[datetime] = None
     from_cache: bool = True
     new_stories_available: bool = False
+    # Task 3: expose the mode used to build this deck
+    mode: Optional[str] = None
 
 
 class RefreshJobStatus(str, Enum):
@@ -181,7 +203,7 @@ class RefreshJob(BaseModel):
     attempts: int = 0
 
 
-# ── Session models ────────────────────────────────────────────────────────────
+# ── Session models ──────────────────────────────────────────────────
 
 class UserSession(BaseModel):
     """Per-device session state."""
@@ -199,3 +221,11 @@ class SessionUpdateRequest(BaseModel):
     selected_topics: List[str] = []
     display_name: str = ""
     location_label: str = ""
+
+
+# ── Task 4: Intent-Based Deck Mode ────────────────────────────────────
+
+class DeckMode(str, Enum):
+    quick = "quick"       # 8-10 stories — glanceable session
+    standard = "standard" # 20 stories    — default
+    deep = "deep"         # 40+ stories   — long read / commute mode
