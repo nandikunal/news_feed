@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Header, HTTPException, Request
-from app.config import settings
+from app.core.config import settings
 from app.services import store
 
 router = APIRouter(prefix="/v1/stories", tags=["stories"])
